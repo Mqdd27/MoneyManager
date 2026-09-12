@@ -59,7 +59,7 @@ Settings can create a JSON backup containing accounts, categories, and transacti
 
 ## Known limitations
 
-- Currency is stored per account, but dashboard totals use USD presentation and do not convert currencies.
+- IDR is the default reporting currency. Accounts retain native IDR or USD values, and reporting totals use the persisted manual USD/IDR rate.
 - Investment holdings track quantity from buy and sell transactions; market price retrieval is not implemented.
 - The app has no cloud sync or banking integration.
 - Xcode is not installed in this environment, so an iOS build must be run locally in Xcode.
