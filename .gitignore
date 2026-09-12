@@ -20,9 +20,17 @@ xcuserdata/
 Secrets.swift
 Config.local.swift
 *.p12
+*.p8
+*.pem
+*.key
 *.mobileprovision
 *.cer
 
 # Application-generated exports and backups
 *.money-manager-backup.json
 *.money-manager-transactions.csv
+MoneyManager-backup.json
+MoneyManager-transactions.csv
+*.financial-backup.json
+*.financial-transactions.csv
+PersonalFinancialData.json
