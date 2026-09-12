@@ -25,17 +25,21 @@ final class PersistenceController {
         let account = NSEntityDescription()
         account.name = "Account"
         account.managedObjectClassName = NSStringFromClass(Account.self)
-        account.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("name", .stringAttributeType), Self.attribute("kind", .stringAttributeType), Self.attribute("currencyCode", .stringAttributeType), Self.attribute("openingBalance", .decimalAttributeType), Self.attribute("createdAt", .dateAttributeType)]
+        account.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("name", .stringAttributeType), Self.attribute("kind", .stringAttributeType), Self.attribute("currencyCode", .stringAttributeType), Self.attribute("openingBalance", .decimalAttributeType), Self.attribute("createdAt", .dateAttributeType), Self.attribute("isDemoData", .booleanAttributeType, defaultValue: false)]
         let category = NSEntityDescription()
         category.name = "Category"
         category.managedObjectClassName = NSStringFromClass(Category.self)
-        category.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("name", .stringAttributeType), Self.attribute("kind", .stringAttributeType)]
+        category.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("name", .stringAttributeType), Self.attribute("kind", .stringAttributeType), Self.attribute("isDemoData", .booleanAttributeType, defaultValue: false)]
         let transaction = NSEntityDescription()
         transaction.name = "Transaction"
         transaction.managedObjectClassName = NSStringFromClass(FinancialTransaction.self)
-        transaction.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("date", .dateAttributeType), Self.attribute("amount", .decimalAttributeType), Self.attribute("note", .stringAttributeType, optional: true), Self.attribute("kind", .stringAttributeType), Self.attribute("transferID", .UUIDAttributeType, optional: true), Self.attribute("investmentSymbol", .stringAttributeType, optional: true), Self.attribute("investmentQuantity", .decimalAttributeType, optional: true), Self.relationship("account", account), Self.relationship("category", category, optional: true)]
+        transaction.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("date", .dateAttributeType), Self.attribute("amount", .decimalAttributeType), Self.attribute("note", .stringAttributeType, optional: true), Self.attribute("kind", .stringAttributeType), Self.attribute("transferID", .UUIDAttributeType, optional: true), Self.attribute("investmentSymbol", .stringAttributeType, optional: true), Self.attribute("investmentQuantity", .decimalAttributeType, optional: true), Self.attribute("isDemoData", .booleanAttributeType, defaultValue: false), Self.relationship("account", account), Self.relationship("category", category, optional: true)]
         model.entities = [account, category, transaction]
         container = NSPersistentContainer(name: "MoneyManager", managedObjectModel: model)
+        container.persistentStoreDescriptions.forEach { description in
+            description.shouldMigrateStoreAutomatically = true
+            description.shouldInferMappingModelAutomatically = true
+        }
         if inMemory { container.persistentStoreDescriptions.first?.url = URL(fileURLWithPath: "/dev/null") }
         container.loadPersistentStores { _, error in
             if let error = error { fatalError("Persistent store error: \(error.localizedDescription)") }
@@ -59,8 +63,8 @@ final class PersistenceController {
         defaults.set(true, forKey: "currencyMigrationV2Completed")
     }
 
-    private static func attribute(_ name: String, _ type: NSAttributeType, optional: Bool = false) -> NSAttributeDescription {
-        let value = NSAttributeDescription(); value.name = name; value.attributeType = type; value.isOptional = optional; return value
+    private static func attribute(_ name: String, _ type: NSAttributeType, optional: Bool = false, defaultValue: Any? = nil) -> NSAttributeDescription {
+        let value = NSAttributeDescription(); value.name = name; value.attributeType = type; value.isOptional = optional; value.defaultValue = defaultValue; return value
     }
 
     private static func relationship(_ name: String, _ destination: NSEntityDescription, optional: Bool = false) -> NSRelationshipDescription {
@@ -73,15 +77,15 @@ extension Category: Identifiable {}
 extension FinancialTransaction: Identifiable {}
 
 @objc(Account) final class Account: NSManagedObject {
-    @NSManaged var id: UUID; @NSManaged var name: String; @NSManaged var kind: String; @NSManaged var currencyCode: String; @NSManaged var openingBalance: NSDecimalNumber; @NSManaged var createdAt: Date
+    @NSManaged var id: UUID; @NSManaged var name: String; @NSManaged var kind: String; @NSManaged var currencyCode: String; @NSManaged var openingBalance: NSDecimalNumber; @NSManaged var createdAt: Date; @NSManaged var isDemoData: Bool
 }
 
 @objc(Category) final class Category: NSManagedObject {
-    @NSManaged var id: UUID; @NSManaged var name: String; @NSManaged var kind: String
+    @NSManaged var id: UUID; @NSManaged var name: String; @NSManaged var kind: String; @NSManaged var isDemoData: Bool
 }
 
 @objc(FinancialTransaction) final class FinancialTransaction: NSManagedObject {
-    @NSManaged var id: UUID; @NSManaged var date: Date; @NSManaged var amount: NSDecimalNumber; @NSManaged var note: String?; @NSManaged var kind: String; @NSManaged var transferID: UUID?; @NSManaged var investmentSymbol: String?; @NSManaged var investmentQuantity: NSDecimalNumber?; @NSManaged var account: Account; @NSManaged var category: Category?
+    @NSManaged var id: UUID; @NSManaged var date: Date; @NSManaged var amount: NSDecimalNumber; @NSManaged var note: String?; @NSManaged var kind: String; @NSManaged var transferID: UUID?; @NSManaged var investmentSymbol: String?; @NSManaged var investmentQuantity: NSDecimalNumber?; @NSManaged var isDemoData: Bool; @NSManaged var account: Account; @NSManaged var category: Category?
 }
 
 enum TransactionKind: String, CaseIterable, Identifiable {
@@ -204,6 +208,58 @@ struct FinancialCalculator {
             guard let symbol = transaction.investmentSymbol, let quantity = transaction.investmentQuantity?.decimalValue else { return }
             result[symbol, default: .zero] += transaction.kind == TransactionKind.investmentSell.rawValue ? -quantity : quantity
         }
+    }
+}
+
+enum DemoDataService {
+    static func hasDemoData(in context: NSManagedObjectContext) -> Bool {
+        let request = NSFetchRequest<NSManagedObject>(entityName: "Account")
+        request.predicate = NSPredicate(format: "isDemoData == YES")
+        return ((try? context.count(for: request)) ?? 0) > 0
+    }
+
+    static func load(in context: NSManagedObjectContext) throws {
+        guard !hasDemoData(in: context) else { return }
+        let checking = Account(context: context)
+        checking.id = UUID(); checking.name = "Demo Checking"; checking.kind = "Checking"; checking.currencyCode = "USD"; checking.openingBalance = 1200; checking.createdAt = Date(); checking.isDemoData = true
+        let groceries = Category(context: context)
+        groceries.id = UUID(); groceries.name = "Demo Groceries"; groceries.kind = TransactionKind.expense.rawValue; groceries.isDemoData = true
+        let salary = Category(context: context)
+        salary.id = UUID(); salary.name = "Demo Salary"; salary.kind = TransactionKind.income.rawValue; salary.isDemoData = true
+        [(-65 as Decimal, "Demo groceries", groceries, TransactionKind.expense), (2400, "Demo paycheck", salary, TransactionKind.income)].forEach { amount, note, category, kind in
+            let transaction = FinancialTransaction(context: context)
+            transaction.id = UUID(); transaction.account = checking; transaction.amount = NSDecimalNumber(decimal: amount); transaction.note = note; transaction.category = category; transaction.kind = kind.rawValue; transaction.date = Date(); transaction.isDemoData = true
+        }
+        try context.save()
+    }
+
+    static func remove(in context: NSManagedObjectContext) throws {
+        let transactions = try fetch(FinancialTransaction.self, in: context)
+        transactions.filter(\.isDemoData).forEach(context.delete)
+        let realTransactions = transactions.filter { !$0.isDemoData }
+        try fetch(Account.self, in: context).filter { account in
+            account.isDemoData && !realTransactions.contains { transaction in transaction.account == account }
+        }.forEach(context.delete)
+        try fetch(Category.self, in: context).filter { category in
+            category.isDemoData && !realTransactions.contains { transaction in transaction.category == category }
+        }.forEach(context.delete)
+        try context.save()
+    }
+
+    static func reset(in context: NSManagedObjectContext) throws {
+        try fetch(FinancialTransaction.self, in: context).forEach(context.delete)
+        try fetch(Account.self, in: context).forEach(context.delete)
+        try fetch(Category.self, in: context).forEach(context.delete)
+        try context.save()
+    }
+
+    private static func fetch<T: NSManagedObject>(_ type: T.Type, in context: NSManagedObjectContext) throws -> [T] {
+        let entityName: String
+        switch type {
+        case is FinancialTransaction.Type: entityName = "Transaction"
+        default: entityName = String(describing: type)
+        }
+        return try context.fetch(NSFetchRequest<T>(entityName: entityName))
     }
 }
 
@@ -450,6 +506,9 @@ struct SettingsView: View {
     @State private var showingCategories = false
     @State private var shareItems: [Any] = []
     @State private var restoring = false
+    @State private var showingRemoveDemoConfirmation = false
+    @State private var showingResetConfirmation = false
+    @State private var showingFinalResetConfirmation = false
     var body: some View {
         NavigationView { Form {
             Section("Security") { Toggle("Require device authentication", isOn: $lockEnabled) }
@@ -468,8 +527,18 @@ struct SettingsView: View {
                 Text("Updated: \(exchangeRates.data.lastUpdated.formatted(date: .abbreviated, time: .shortened))")
             }
             Section("Categories") { Button("Manage Categories") { showingCategories = true } }
-            Section("Data") { Button("Export CSV") { shareItems = [BackupService.csv(accounts: Array(accounts), transactions: Array(transactions))] }; Button("Create JSON Backup") { shareItems = [BackupService.backup(accounts: Array(accounts), categories: Array(categories), transactions: Array(transactions))] }; Button("Restore JSON Backup") { restoring = true }; Button("Load Demo Data") { BackupService.demo(context: context) } }
-        }.navigationTitle("Settings").sheet(isPresented: $showingCategories) { CategoriesView() }.sheet(isPresented: Binding(get: { !shareItems.isEmpty }, set: { if !$0 { shareItems = [] } })) { ActivityView(items: shareItems) }.sheet(isPresented: $restoring) { BackupPicker { url in BackupService.restore(from: url, context: context) } } }
+            Section("Data") {
+                Button("Export CSV") { shareItems = [BackupService.csv(accounts: Array(accounts), transactions: Array(transactions))] }
+                Button("Create JSON Backup") { shareItems = [BackupService.backup(accounts: Array(accounts), categories: Array(categories), transactions: Array(transactions))] }
+                Button("Restore JSON Backup") { restoring = true }
+                Button(DemoDataService.hasDemoData(in: context) ? "Reload Demo Data" : "Load Demo Data") {
+                    if DemoDataService.hasDemoData(in: context) { try? DemoDataService.remove(in: context) }
+                    try? DemoDataService.load(in: context)
+                }
+                Button("Remove Demo Data", role: .destructive) { showingRemoveDemoConfirmation = true }.disabled(!DemoDataService.hasDemoData(in: context))
+                Button("Reset All Data", role: .destructive) { showingResetConfirmation = true }
+            }
+        }.navigationTitle("Settings").sheet(isPresented: $showingCategories) { CategoriesView() }.sheet(isPresented: Binding(get: { !shareItems.isEmpty }, set: { if !$0 { shareItems = [] } })) { ActivityView(items: shareItems) }.sheet(isPresented: $restoring) { BackupPicker { url in BackupService.restore(from: url, context: context) } }.alert("Remove Demo Data?", isPresented: $showingRemoveDemoConfirmation) { Button("Remove Demo Data", role: .destructive) { try? DemoDataService.remove(in: context) }; Button("Cancel", role: .cancel) {} } message: { Text("This will remove all sample accounts, transactions, investments, assets, and other demo records. Your own data will not be affected.") }.alert("Reset All Data?", isPresented: $showingResetConfirmation) { Button("Continue", role: .destructive) { showingFinalResetConfirmation = true }; Button("Cancel", role: .cancel) {} } message: { Text("This permanently deletes all accounts, transactions, investments, assets, liabilities, and app data stored locally on this device.") }.alert("Permanently Delete All Data?", isPresented: $showingFinalResetConfirmation) { Button("Delete All Data", role: .destructive) { try? DemoDataService.reset(in: context) }; Button("Cancel", role: .cancel) {} } message: { Text("This cannot be undone. Consider creating a backup first.") } }
     }
 }
 
@@ -516,15 +585,27 @@ struct Backup: Codable {
         self.version = version; self.accounts = accounts; self.categories = categories; self.transactions = transactions; self.settings = settings; self.rateData = rateData
     }
 }
-struct BackupAccount: Codable { var id: UUID; var name: String; var kind: String; var currencyCode: String?; var openingBalance: Decimal; var createdAt: Date }
-struct BackupCategory: Codable { var id: UUID; var name: String; var kind: String }
-struct BackupTransaction: Codable { var id: UUID; var date: Date; var amount: Decimal; var note: String?; var kind: String; var transferID: UUID?; var investmentSymbol: String?; var investmentQuantity: Decimal?; var accountID: UUID; var categoryID: UUID? }
+struct BackupAccount: Codable {
+    var id: UUID; var name: String; var kind: String; var currencyCode: String?; var openingBalance: Decimal; var createdAt: Date; var isDemoData: Bool
+    init(id: UUID, name: String, kind: String, currencyCode: String?, openingBalance: Decimal, createdAt: Date, isDemoData: Bool = false) { self.id = id; self.name = name; self.kind = kind; self.currencyCode = currencyCode; self.openingBalance = openingBalance; self.createdAt = createdAt; self.isDemoData = isDemoData }
+    init(from decoder: Decoder) throws { let container = try decoder.container(keyedBy: CodingKeys.self); id = try container.decode(UUID.self, forKey: .id); name = try container.decode(String.self, forKey: .name); kind = try container.decode(String.self, forKey: .kind); currencyCode = try container.decodeIfPresent(String.self, forKey: .currencyCode); openingBalance = try container.decode(Decimal.self, forKey: .openingBalance); createdAt = try container.decode(Date.self, forKey: .createdAt); isDemoData = try container.decodeIfPresent(Bool.self, forKey: .isDemoData) ?? false }
+}
+struct BackupCategory: Codable {
+    var id: UUID; var name: String; var kind: String; var isDemoData: Bool
+    init(id: UUID, name: String, kind: String, isDemoData: Bool = false) { self.id = id; self.name = name; self.kind = kind; self.isDemoData = isDemoData }
+    init(from decoder: Decoder) throws { let container = try decoder.container(keyedBy: CodingKeys.self); id = try container.decode(UUID.self, forKey: .id); name = try container.decode(String.self, forKey: .name); kind = try container.decode(String.self, forKey: .kind); isDemoData = try container.decodeIfPresent(Bool.self, forKey: .isDemoData) ?? false }
+}
+struct BackupTransaction: Codable {
+    var id: UUID; var date: Date; var amount: Decimal; var note: String?; var kind: String; var transferID: UUID?; var investmentSymbol: String?; var investmentQuantity: Decimal?; var accountID: UUID; var categoryID: UUID?; var isDemoData: Bool
+    init(id: UUID, date: Date, amount: Decimal, note: String?, kind: String, transferID: UUID?, investmentSymbol: String?, investmentQuantity: Decimal?, accountID: UUID, categoryID: UUID?, isDemoData: Bool = false) { self.id = id; self.date = date; self.amount = amount; self.note = note; self.kind = kind; self.transferID = transferID; self.investmentSymbol = investmentSymbol; self.investmentQuantity = investmentQuantity; self.accountID = accountID; self.categoryID = categoryID; self.isDemoData = isDemoData }
+    init(from decoder: Decoder) throws { let container = try decoder.container(keyedBy: CodingKeys.self); id = try container.decode(UUID.self, forKey: .id); date = try container.decode(Date.self, forKey: .date); amount = try container.decode(Decimal.self, forKey: .amount); note = try container.decodeIfPresent(String.self, forKey: .note); kind = try container.decode(String.self, forKey: .kind); transferID = try container.decodeIfPresent(UUID.self, forKey: .transferID); investmentSymbol = try container.decodeIfPresent(String.self, forKey: .investmentSymbol); investmentQuantity = try container.decodeIfPresent(Decimal.self, forKey: .investmentQuantity); accountID = try container.decode(UUID.self, forKey: .accountID); categoryID = try container.decodeIfPresent(UUID.self, forKey: .categoryID); isDemoData = try container.decodeIfPresent(Bool.self, forKey: .isDemoData) ?? false }
+}
 
 enum BackupService {
-    static func backup(accounts: [Account], categories: [Category], transactions: [FinancialTransaction], settings: ReportingSettings = .current(), rateData: ExchangeRateData = ExchangeRateService.shared.data) -> URL { let value = Backup(version: 2, accounts: accounts.map { BackupAccount(id: $0.id, name: $0.name, kind: $0.kind, currencyCode: $0.currencyCode, openingBalance: $0.openingBalance.decimalValue, createdAt: $0.createdAt) }, categories: categories.map { BackupCategory(id: $0.id, name: $0.name, kind: $0.kind) }, transactions: transactions.map { BackupTransaction(id: $0.id, date: $0.date, amount: $0.amount.decimalValue, note: $0.note, kind: $0.kind, transferID: $0.transferID, investmentSymbol: $0.investmentSymbol, investmentQuantity: $0.investmentQuantity?.decimalValue, accountID: $0.account.id, categoryID: $0.category?.id) }, settings: settings, rateData: rateData); return write(try! JSONEncoder().encode(value), named: "MoneyManager-backup.json") }
+    static func backup(accounts: [Account], categories: [Category], transactions: [FinancialTransaction], settings: ReportingSettings = .current(), rateData: ExchangeRateData = ExchangeRateService.shared.data) -> URL { let value = Backup(version: 2, accounts: accounts.map { BackupAccount(id: $0.id, name: $0.name, kind: $0.kind, currencyCode: $0.currencyCode, openingBalance: $0.openingBalance.decimalValue, createdAt: $0.createdAt, isDemoData: $0.isDemoData) }, categories: categories.map { BackupCategory(id: $0.id, name: $0.name, kind: $0.kind, isDemoData: $0.isDemoData) }, transactions: transactions.map { BackupTransaction(id: $0.id, date: $0.date, amount: $0.amount.decimalValue, note: $0.note, kind: $0.kind, transferID: $0.transferID, investmentSymbol: $0.investmentSymbol, investmentQuantity: $0.investmentQuantity?.decimalValue, accountID: $0.account.id, categoryID: $0.category?.id, isDemoData: $0.isDemoData) }, settings: settings, rateData: rateData); return write(try! JSONEncoder().encode(value), named: "MoneyManager-backup.json") }
     static func csv(accounts: [Account], transactions: [FinancialTransaction]) -> URL { let rows = ["Date,Type,Account,Currency,Amount,Note"] + transactions.map { "\($0.date.formatted(date: .numeric, time: .omitted)),\($0.kind),\(quote($0.account.name)),\($0.account.currencyCode),\($0.amount.stringValue),\(quote($0.note ?? ""))" }; return write(rows.joined(separator: "\n").data(using: .utf8)!, named: "MoneyManager-transactions.csv") }
-    static func restore(from url: URL, context: NSManagedObjectContext) { guard url.startAccessingSecurityScopedResource() else { return }; defer { url.stopAccessingSecurityScopedResource() }; guard let value = try? JSONDecoder().decode(Backup.self, from: Data(contentsOf: url)) else { return }; value.settings?.save(); if let rateData = value.rateData { ExchangeRateService.shared.restore(rateData) }; context.performAndWait { let request = NSFetchRequest<NSFetchRequestResult>(entityName: "Transaction"); let delete = NSBatchDeleteRequest(fetchRequest: request); _ = try? context.execute(delete); ["Account", "Category"].forEach { name in let request = NSFetchRequest<NSFetchRequestResult>(entityName: name); _ = try? context.execute(NSBatchDeleteRequest(fetchRequest: request)) }; let accounts = Dictionary(uniqueKeysWithValues: value.accounts.map { item -> (UUID, Account) in let object = Account(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.currencyCode = CurrencyFormatter.normalizedCode(item.currencyCode); object.openingBalance = NSDecimalNumber(decimal: item.openingBalance); object.createdAt = item.createdAt; return (item.id, object) }); let categories = Dictionary(uniqueKeysWithValues: value.categories.map { item -> (UUID, Category) in let object = Category(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; return (item.id, object) }); value.transactions.forEach { item in guard let account = accounts[item.accountID] else { return }; let object = FinancialTransaction(context: context); object.id = item.id; object.date = item.date; object.amount = NSDecimalNumber(decimal: item.amount); object.note = item.note; object.kind = item.kind; object.transferID = item.transferID; object.investmentSymbol = item.investmentSymbol; object.investmentQuantity = item.investmentQuantity.map(NSDecimalNumber.init(decimal:)); object.account = account; object.category = item.categoryID.flatMap { categories[$0] } }; try? context.save() } }
-    static func demo(context: NSManagedObjectContext) { guard (try? context.count(for: NSFetchRequest<Account>(entityName: "Account"))) == 0 else { return }; let checking = Account(context: context); checking.id = UUID(); checking.name = "Checking"; checking.kind = "Checking"; checking.currencyCode = "USD"; checking.openingBalance = 1200; checking.createdAt = Date(); let groceries = Category(context: context); groceries.id = UUID(); groceries.name = "Groceries"; groceries.kind = "expense"; let salary = Category(context: context); salary.id = UUID(); salary.name = "Salary"; salary.kind = "income"; [(-65 as Decimal, "Groceries", groceries, "expense"), (2400, "Paycheck", salary, "income")].forEach { amount, note, category, kind in let transaction = FinancialTransaction(context: context); transaction.id = UUID(); transaction.account = checking; transaction.amount = NSDecimalNumber(decimal: amount); transaction.note = note; transaction.category = category; transaction.kind = kind; transaction.date = Date() }; try? context.save() }
+    static func restore(from url: URL, context: NSManagedObjectContext) { guard url.startAccessingSecurityScopedResource() else { return }; defer { url.stopAccessingSecurityScopedResource() }; guard let value = try? JSONDecoder().decode(Backup.self, from: Data(contentsOf: url)) else { return }; value.settings?.save(); if let rateData = value.rateData { ExchangeRateService.shared.restore(rateData) }; context.performAndWait { let request = NSFetchRequest<NSFetchRequestResult>(entityName: "Transaction"); let delete = NSBatchDeleteRequest(fetchRequest: request); _ = try? context.execute(delete); ["Account", "Category"].forEach { name in let request = NSFetchRequest<NSFetchRequestResult>(entityName: name); _ = try? context.execute(NSBatchDeleteRequest(fetchRequest: request)) }; let accounts = Dictionary(uniqueKeysWithValues: value.accounts.map { item -> (UUID, Account) in let object = Account(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.currencyCode = CurrencyFormatter.normalizedCode(item.currencyCode); object.openingBalance = NSDecimalNumber(decimal: item.openingBalance); object.createdAt = item.createdAt; object.isDemoData = item.isDemoData; return (item.id, object) }); let categories = Dictionary(uniqueKeysWithValues: value.categories.map { item -> (UUID, Category) in let object = Category(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.isDemoData = item.isDemoData; return (item.id, object) }); value.transactions.forEach { item in guard let account = accounts[item.accountID] else { return }; let object = FinancialTransaction(context: context); object.id = item.id; object.date = item.date; object.amount = NSDecimalNumber(decimal: item.amount); object.note = item.note; object.kind = item.kind; object.transferID = item.transferID; object.investmentSymbol = item.investmentSymbol; object.investmentQuantity = item.investmentQuantity.map(NSDecimalNumber.init(decimal:)); object.account = account; object.isDemoData = item.isDemoData; object.category = item.categoryID.flatMap { categories[$0] } }; try? context.save() } }
+    static func demo(context: NSManagedObjectContext) { try? DemoDataService.load(in: context) }
     private static func write(_ data: Data, named: String) -> URL { let url = FileManager.default.temporaryDirectory.appendingPathComponent(named); try? data.write(to: url, options: .atomic); return url }
     private static func quote(_ value: String) -> String { "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\"" }
 }
