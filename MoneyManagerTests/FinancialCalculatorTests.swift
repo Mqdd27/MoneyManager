@@ -58,11 +58,18 @@ final class FinancialCalculatorTests: XCTestCase {
     func testBackupDTOPreservesSettingsAndRateDataAndReadsOldBackup() throws {
         let settings = ReportingSettings(baseCurrency: "USD", secondaryCurrency: "IDR")
         let rate = ExchangeRateData(usdIDR: 15000, source: "Manual", lastUpdated: Date(timeIntervalSince1970: 0))
-        let backup = Backup(accounts: [], categories: [], transactions: [], settings: settings, rateData: rate)
+        let accountID = UUID(), categoryID = UUID()
+        let backup = Backup(accounts: [BackupAccount(id: accountID, name: "Demo", kind: "Checking", currencyCode: "USD", openingBalance: 1, createdAt: Date(), isDemoData: true)], categories: [BackupCategory(id: categoryID, name: "Demo", kind: "expense", isDemoData: true)], transactions: [BackupTransaction(id: UUID(), date: Date(), amount: -1, note: nil, kind: "expense", transferID: nil, investmentSymbol: nil, investmentQuantity: nil, accountID: accountID, categoryID: categoryID, isDemoData: true)], settings: settings, rateData: rate)
         let decoded = try JSONDecoder().decode(Backup.self, from: JSONEncoder().encode(backup))
         XCTAssertEqual(decoded.version, 2)
         XCTAssertEqual(decoded.settings, settings)
         XCTAssertEqual(decoded.rateData, rate)
+        XCTAssertTrue(decoded.accounts[0].isDemoData)
+        XCTAssertTrue(decoded.categories[0].isDemoData)
+        XCTAssertTrue(decoded.transactions[0].isDemoData)
+        XCTAssertFalse(try JSONDecoder().decode(BackupAccount.self, from: Data("{\"id\":\"\(UUID())\",\"name\":\"Account\",\"kind\":\"Checking\",\"openingBalance\":0,\"createdAt\":0}".utf8)).isDemoData)
+        XCTAssertFalse(try JSONDecoder().decode(BackupCategory.self, from: Data("{\"id\":\"\(UUID())\",\"name\":\"Category\",\"kind\":\"expense\"}".utf8)).isDemoData)
+        XCTAssertFalse(try JSONDecoder().decode(BackupTransaction.self, from: Data("{\"id\":\"\(UUID())\",\"date\":0,\"amount\":0,\"kind\":\"expense\",\"accountID\":\"\(accountID)\"}".utf8)).isDemoData)
 
         let old = try JSONEncoder().encode(Backup(version: 1, accounts: [], categories: [], transactions: []))
         let oldDecoded = try JSONDecoder().decode(Backup.self, from: old)
@@ -70,10 +77,80 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertNil(oldDecoded.rateData)
     }
 
+    func testDemoDataLoadIsIdempotentAndKeepsRelationships() throws {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        try DemoDataService.load(in: context)
+        try DemoDataService.load(in: context)
+
+        let accounts = try context.fetch(NSFetchRequest<Account>(entityName: "Account"))
+        let categories = try context.fetch(NSFetchRequest<MoneyManager.Category>(entityName: "Category"))
+        let transactions = try context.fetch(NSFetchRequest<FinancialTransaction>(entityName: "Transaction"))
+        XCTAssertEqual(accounts.filter(\.isDemoData).count, 1)
+        XCTAssertEqual(categories.filter(\.isDemoData).count, 2)
+        XCTAssertEqual(transactions.filter(\.isDemoData).count, 2)
+        XCTAssertTrue(transactions.allSatisfy { $0.account.isDemoData && $0.category?.isDemoData == true })
+    }
+
+    func testRemovingDemoDataPreservesRealRecordsAndCalculation() throws {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let realAccount = account(context, currency: "USD", openingBalance: 100)
+        let realCategory = category(context, name: "Real", kind: .income)
+        let realTransaction = transaction(context, account: realAccount, amount: 25, kind: .income)
+        realTransaction.category = realCategory
+        try context.save()
+        try DemoDataService.load(in: context)
+
+        try DemoDataService.remove(in: context)
+        let accounts = try context.fetch(NSFetchRequest<Account>(entityName: "Account"))
+        let categories = try context.fetch(NSFetchRequest<MoneyManager.Category>(entityName: "Category"))
+        let transactions = try context.fetch(NSFetchRequest<FinancialTransaction>(entityName: "Transaction"))
+        XCTAssertEqual(accounts.map(\.id), [realAccount.id])
+        XCTAssertEqual(categories.map(\.id), [realCategory.id])
+        XCTAssertEqual(transactions.map(\.id), [realTransaction.id])
+        XCTAssertEqual(FinancialCalculator.balance(account: realAccount, transactions: transactions), 125)
+    }
+
+    func testRemovingDemoDataPreservesDemoParentsUsedByRealTransactions() throws {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        try DemoDataService.load(in: context)
+        let demoTransaction = try context.fetch(NSFetchRequest<FinancialTransaction>(entityName: "Transaction")).first!
+        let demoAccount = demoTransaction.account
+        let demoCategory = demoTransaction.category!
+        let realTransaction = transaction(context, account: demoAccount, amount: 10, kind: .income)
+        realTransaction.category = demoCategory
+        try context.save()
+
+        try DemoDataService.remove(in: context)
+        XCTAssertFalse(demoAccount.isDeleted)
+        XCTAssertFalse(demoCategory.isDeleted)
+        XCTAssertFalse(realTransaction.isDeleted)
+    }
+
+    func testResetAllDataDeletesEveryFinancialRecord() throws {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let realAccount = account(context, currency: "USD")
+        let realCategory = category(context, name: "Real", kind: .expense)
+        let realTransaction = transaction(context, account: realAccount, amount: -1, kind: .expense)
+        realTransaction.category = realCategory
+        try context.save()
+        try DemoDataService.load(in: context)
+
+        try DemoDataService.reset(in: context)
+        XCTAssertEqual(try context.count(for: NSFetchRequest<Account>(entityName: "Account")), 0)
+        XCTAssertEqual(try context.count(for: NSFetchRequest<MoneyManager.Category>(entityName: "Category")), 0)
+        XCTAssertEqual(try context.count(for: NSFetchRequest<FinancialTransaction>(entityName: "Transaction")), 0)
+    }
+
     private func account(_ context: NSManagedObjectContext, currency: String, openingBalance: Decimal = 0) -> Account {
         let account = Account(context: context)
         account.id = UUID(); account.name = "Account"; account.kind = "Checking"; account.currencyCode = currency; account.openingBalance = NSDecimalNumber(decimal: openingBalance); account.createdAt = Date()
         return account
+    }
+
+    private func category(_ context: NSManagedObjectContext, name: String, kind: TransactionKind) -> MoneyManager.Category {
+        let category = MoneyManager.Category(context: context)
+        category.id = UUID(); category.name = name; category.kind = kind.rawValue
+        return category
     }
 
     private func transaction(_ context: NSManagedObjectContext, account: Account, amount: Decimal, kind: TransactionKind) -> FinancialTransaction {
