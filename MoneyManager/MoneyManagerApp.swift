@@ -2,6 +2,7 @@ import SwiftUI
 import CoreData
 import LocalAuthentication
 import UniformTypeIdentifiers
+import UIKit
 
 @main
 struct MoneyManagerApp: App {

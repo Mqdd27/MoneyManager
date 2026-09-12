@@ -32,6 +32,23 @@ Run tests:
 xcodebuild -project MoneyManager.xcodeproj -scheme MoneyManager -destination 'platform=iOS Simulator,name=iPhone 7' test
 ```
 
+## First Xcode and device build checklist
+
+- [ ] Install Xcode 14 or later and accept its license.
+- [ ] Open `MoneyManager.xcodeproj` and select the `MoneyManager` target.
+- [ ] In Signing & Capabilities, select an Apple Account Personal Team or development team.
+- [ ] Replace `com.example.MoneyManager` with a unique bundle identifier owned by that team.
+- [ ] Keep `IPHONEOS_DEPLOYMENT_TARGET` at `15.0` for both app and test targets.
+- [ ] Connect the iPhone 7 with a data cable, unlock it, and trust the Mac if prompted.
+- [ ] On iOS 16 or later, enable Developer Mode if the device requires it. iOS 15 does not have Developer Mode.
+- [ ] Select the connected iPhone as the `MoneyManager` run destination.
+- [ ] Build and run the app. Do not treat this project as device-tested until this succeeds.
+- [ ] Run `MoneyManagerTests` from Xcode's Test navigator or the scheme test action.
+- [ ] Launch the installed app and enable device authentication in Settings. Verify the lock reads and authenticates with Touch ID on iPhone 7.
+- [ ] Add an account and transaction, relaunch the app, and verify Core Data persistence.
+- [ ] Create a JSON backup, share/save it, restore it through Settings, and verify restored records.
+- [ ] Export CSV and verify its headers, quoted text, amounts, and transaction rows in a spreadsheet or text editor.
+
 ## Sideloading
 
 Connect an iPhone, select it as the run destination, set the target Signing & Capabilities team to a personal Apple ID or development team, then run from Xcode. A free Apple ID requires periodically re-signing the app.

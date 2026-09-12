@@ -19,7 +19,7 @@ final class FinancialCalculatorTests: XCTestCase {
         transaction.amount = -3.25
         transaction.kind = TransactionKind.expense.rawValue
 
-        XCTAssertEqual(FinancialCalculator.balance(account: account, transactions: [transaction]), Decimal(string: "6.75"))
+        XCTAssertEqual(FinancialCalculator.balance(account: account, transactions: [transaction]), Decimal(string: "6.75")!)
     }
 
     func testCashFlowExcludesTransfers() {
