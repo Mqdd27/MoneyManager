@@ -1,0 +1,28 @@
+# Xcode
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.swp
+*.tmp
+*.bak
+
+# Secrets and local configuration
+.env
+.env.*
+Secrets.swift
+Config.local.swift
+*.p12
+*.mobileprovision
+*.cer
+
+# Application-generated exports and backups
+*.money-manager-backup.json
+*.money-manager-transactions.csv
