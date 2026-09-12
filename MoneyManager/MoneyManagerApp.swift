@@ -41,6 +41,22 @@ final class PersistenceController {
             if let error = error { fatalError("Persistent store error: \(error.localizedDescription)") }
         }
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
+        migrateCurrencies()
+    }
+
+    private func migrateCurrencies() {
+        let context = container.viewContext
+        let request = NSFetchRequest<Account>(entityName: "Account")
+        guard let accounts = try? context.fetch(request) else { return }
+        let defaults = UserDefaults.standard
+        let migratesLegacyUSD = !defaults.bool(forKey: "currencyMigrationV2Completed")
+        var changed = false
+        accounts.forEach { account in
+            let currency = migratesLegacyUSD && account.currencyCode == "USD" ? "IDR" : CurrencyFormatter.normalizedCode(account.currencyCode)
+            if account.currencyCode != currency { account.currencyCode = currency; changed = true }
+        }
+        if changed { try? context.save() }
+        defaults.set(true, forKey: "currencyMigrationV2Completed")
     }
 
     private static func attribute(_ name: String, _ type: NSAttributeType, optional: Bool = false) -> NSAttributeDescription {
@@ -74,20 +90,110 @@ enum TransactionKind: String, CaseIterable, Identifiable {
     var title: String { switch self { case .income: return "Income"; case .expense: return "Expense"; case .transfer: return "Transfer"; case .investmentBuy: return "Buy investment"; case .investmentSell: return "Sell investment" } }
 }
 
+struct CurrencyFormatter {
+    static let supportedCodes = ["IDR", "USD"]
+
+    static func string(_ value: Decimal, code: String) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.locale = Locale(identifier: normalizedCode(code) == "IDR" ? "id_ID" : "en_US")
+        formatter.currencyCode = normalizedCode(code)
+        formatter.maximumFractionDigits = normalizedCode(code) == "IDR" ? 0 : 2
+        formatter.minimumFractionDigits = normalizedCode(code) == "IDR" ? 0 : 2
+        return formatter.string(from: NSDecimalNumber(decimal: value)) ?? "\(value) \(normalizedCode(code))"
+    }
+
+    static func normalizedCode(_ code: String?) -> String {
+        guard let code = code?.uppercased(), supportedCodes.contains(code) else { return "IDR" }
+        return code
+    }
+}
+
+struct ExchangeRateData: Codable, Equatable {
+    var usdIDR: Decimal
+    var source: String
+    var lastUpdated: Date
+}
+
+final class ExchangeRateService: ObservableObject {
+    static let shared = ExchangeRateService()
+    @Published private(set) var data: ExchangeRateData
+    private let key = "usdIDRRateV2"
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let saved = defaults.data(forKey: key), let decoded = try? JSONDecoder().decode(ExchangeRateData.self, from: saved) {
+            data = decoded
+        } else {
+            data = ExchangeRateData(usdIDR: 0, source: "Manual", lastUpdated: Date())
+        }
+    }
+
+    var usdIDRRate: Decimal { data.usdIDR }
+
+    func rate(for code: String) -> Decimal? {
+        switch CurrencyFormatter.normalizedCode(code) {
+        case "USD": return 1
+        case "IDR": return data.usdIDR > 0 ? data.usdIDR : nil
+        default: return nil
+        }
+    }
+
+    func convert(_ amount: Decimal, from: String, to: String) -> Decimal? {
+        let source = CurrencyFormatter.normalizedCode(from), destination = CurrencyFormatter.normalizedCode(to)
+        if source == destination { return amount }
+        guard let sourceRate = rate(for: source), let destinationRate = rate(for: destination) else { return nil }
+        return amount / sourceRate * destinationRate
+    }
+
+    func setUSDIDRRate(_ rate: Decimal?, source: String = "Manual", lastUpdated: Date = Date()) {
+        data = ExchangeRateData(usdIDR: max(rate ?? 0, 0), source: source, lastUpdated: lastUpdated)
+        defaults.set(try? JSONEncoder().encode(data), forKey: key)
+    }
+
+    func restore(_ data: ExchangeRateData) {
+        setUSDIDRRate(data.usdIDR, source: data.source, lastUpdated: data.lastUpdated)
+    }
+}
+
+struct ReportingSettings: Codable, Equatable {
+    var baseCurrency: String
+    var secondaryCurrency: String?
+
+    init(baseCurrency: String = "IDR", secondaryCurrency: String? = "USD") {
+        self.baseCurrency = CurrencyFormatter.normalizedCode(baseCurrency)
+        let secondary = secondaryCurrency.map(CurrencyFormatter.normalizedCode)
+        self.secondaryCurrency = secondary == self.baseCurrency ? nil : secondary
+    }
+
+    static func current(defaults: UserDefaults = .standard) -> ReportingSettings {
+        ReportingSettings(baseCurrency: defaults.string(forKey: "reportingBaseCurrency") ?? "IDR", secondaryCurrency: defaults.string(forKey: "reportingSecondaryCurrency"))
+    }
+
+    func save(defaults: UserDefaults = .standard) {
+        defaults.set(baseCurrency, forKey: "reportingBaseCurrency")
+        defaults.set(secondaryCurrency, forKey: "reportingSecondaryCurrency")
+    }
+}
+
 struct FinancialCalculator {
     static func balance(account: Account, transactions: [FinancialTransaction]) -> Decimal {
         transactions.filter { $0.account.objectID == account.objectID }.reduce(account.openingBalance.decimalValue) { $0 + $1.amount.decimalValue }
     }
 
-    static func netWorth(accounts: [Account], transactions: [FinancialTransaction]) -> Decimal {
-        accounts.reduce(.zero) { $0 + balance(account: $1, transactions: transactions) }
+    static func netWorth(accounts: [Account], transactions: [FinancialTransaction], currencyCode: String = "IDR", rates: ExchangeRateService = .shared) -> Decimal {
+        accounts.reduce(.zero) { total, account in
+            total + (rates.convert(balance(account: account, transactions: transactions), from: account.currencyCode, to: currencyCode) ?? .zero)
+        }
     }
 
-    static func cashFlow(_ transactions: [FinancialTransaction]) -> (income: Decimal, expense: Decimal) {
+    static func cashFlow(_ transactions: [FinancialTransaction], currencyCode: String, rates: ExchangeRateService = .shared) -> (income: Decimal, expense: Decimal) {
         transactions.reduce((.zero, .zero)) { total, transaction in
+            guard let amount = rates.convert(transaction.amount.decimalValue, from: transaction.account.currencyCode, to: currencyCode) else { return total }
             switch transaction.kind {
-            case TransactionKind.income.rawValue: return (total.0 + transaction.amount.decimalValue, total.1)
-            case TransactionKind.expense.rawValue: return (total.0, total.1 + abs(transaction.amount.decimalValue))
+            case TransactionKind.income.rawValue: return (total.0 + amount, total.1)
+            case TransactionKind.expense.rawValue: return (total.0, total.1 + abs(amount))
             default: return total
             }
         }
@@ -164,17 +270,31 @@ struct MainTabView: View {
 struct DashboardView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Account.createdAt, ascending: true)]) private var accounts: FetchedResults<Account>
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
-    private var cashFlow: (income: Decimal, expense: Decimal) { FinancialCalculator.cashFlow(Array(transactions)) }
+    @AppStorage("reportingBaseCurrency") private var baseCurrency = "IDR"
+    @AppStorage("reportingSecondaryCurrency") private var secondaryCurrency = "USD"
+    private var reportingCurrency: String { CurrencyFormatter.normalizedCode(baseCurrency) }
+    private var secondaryReportingCurrency: String? { secondaryCurrency.isEmpty ? nil : CurrencyFormatter.normalizedCode(secondaryCurrency) }
+    private var cashFlow: (income: Decimal, expense: Decimal) { FinancialCalculator.cashFlow(Array(transactions), currencyCode: reportingCurrency) }
 
     var body: some View {
         NavigationView {
             List {
+                Section(header: Text("Currency")) {
+                    Picker("Reporting currency", selection: $baseCurrency) {
+                        Text("IDR").tag("IDR")
+                        Text("USD").tag("USD")
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: baseCurrency) { value in secondaryCurrency = CurrencyFormatter.normalizedCode(value) == "IDR" ? "USD" : "IDR" }
+                }
                 Section(header: Text("Net Worth")) {
-                    Text(FinancialCalculator.netWorth(accounts: Array(accounts), transactions: Array(transactions)), format: .currency(code: "USD")).font(.title2).fontWeight(.semibold)
+                    let total = FinancialCalculator.netWorth(accounts: Array(accounts), transactions: Array(transactions), currencyCode: reportingCurrency)
+                    Text(CurrencyFormatter.string(total, code: reportingCurrency)).font(.title2).fontWeight(.semibold)
+                    if let secondary = secondaryReportingCurrency, let converted = ExchangeRateService.shared.convert(total, from: reportingCurrency, to: secondary) { Text("Approx. " + CurrencyFormatter.string(converted, code: secondary)).foregroundColor(.secondary) }
                 }
                 Section(header: Text("Cash Flow")) {
-                    ValueRow(title: "Income", value: cashFlow.income, currencyCode: "USD")
-                    ValueRow(title: "Expenses", value: cashFlow.expense, currencyCode: "USD")
+                    ValueRow(title: "Income", value: cashFlow.income, currencyCode: reportingCurrency)
+                    ValueRow(title: "Expenses", value: cashFlow.expense, currencyCode: reportingCurrency)
                 }
                 Section(header: Text("Recent Activity")) {
                     ForEach(transactions.prefix(5)) { TransactionRow(transaction: $0) }
@@ -194,7 +314,7 @@ struct ValueRow: View {
         HStack {
             Text(title)
             Spacer()
-            Text(value, format: .currency(code: currencyCode))
+            Text(CurrencyFormatter.string(value, code: currencyCode))
         }
     }
 }
@@ -221,14 +341,16 @@ struct AccountEditor: View {
     @State private var name = ""
     @State private var opening = "0"
     @State private var kind = "Checking"
+    @State private var currencyCode = "IDR"
     var body: some View {
         NavigationView { Form {
             TextField("Account name", text: $name)
             Picker("Type", selection: $kind) { ForEach(["Checking", "Savings", "Cash", "Investment"], id: \.self) { Text($0) } }
+            Picker("Currency", selection: $currencyCode) { ForEach(CurrencyFormatter.supportedCodes, id: \.self) { Text($0) } }
             TextField("Opening balance", text: $opening).keyboardType(.decimalPad)
         }.navigationTitle("New Account").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) } } }
     }
-    private func save() { let account = Account(context: context); account.id = UUID(); account.name = name.trimmingCharacters(in: .whitespacesAndNewlines); account.kind = kind; account.currencyCode = "USD"; account.openingBalance = NSDecimalNumber(string: opening); account.createdAt = Date(); try? context.save(); dismiss() }
+    private func save() { let account = Account(context: context); account.id = UUID(); account.name = name.trimmingCharacters(in: .whitespacesAndNewlines); account.kind = kind; account.currencyCode = CurrencyFormatter.normalizedCode(currencyCode); account.openingBalance = NSDecimalNumber(string: opening); account.createdAt = Date(); try? context.save(); dismiss() }
 }
 
 struct TransactionsView: View {
@@ -252,7 +374,7 @@ struct TransactionsView: View {
 struct TransactionRow: View {
     let transaction: FinancialTransaction
     var body: some View {
-        HStack { VStack(alignment: .leading) { Text(transaction.note ?? TransactionKind(rawValue: transaction.kind)?.title ?? transaction.kind); Text(transaction.account.name + " · " + transaction.date.formatted(date: .abbreviated, time: .omitted)).font(.caption).foregroundColor(.secondary) }; Spacer(); Text(transaction.amount.decimalValue, format: .currency(code: transaction.account.currencyCode)).foregroundColor(transaction.amount.decimalValue < 0 ? .red : .primary) }
+        HStack { VStack(alignment: .leading) { Text(transaction.note ?? TransactionKind(rawValue: transaction.kind)?.title ?? transaction.kind); Text(transaction.account.name + " · " + transaction.date.formatted(date: .abbreviated, time: .omitted)).font(.caption).foregroundColor(.secondary) }; Spacer(); Text(CurrencyFormatter.string(transaction.amount.decimalValue, code: transaction.account.currencyCode)).foregroundColor(transaction.amount.decimalValue < 0 ? .red : .primary) }
     }
 }
 
@@ -319,6 +441,9 @@ struct PortfolioView: View {
 struct SettingsView: View {
     @Environment(\.managedObjectContext) private var context
     @AppStorage("appLockEnabled") private var lockEnabled = false
+    @AppStorage("reportingBaseCurrency") private var baseCurrency = "IDR"
+    @AppStorage("reportingSecondaryCurrency") private var secondaryCurrency = "USD"
+    @StateObject private var exchangeRates = ExchangeRateService.shared
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Account.name, ascending: true)]) private var accounts: FetchedResults<Account>
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Category.name, ascending: true)]) private var categories: FetchedResults<Category>
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
@@ -328,6 +453,20 @@ struct SettingsView: View {
     var body: some View {
         NavigationView { Form {
             Section("Security") { Toggle("Require device authentication", isOn: $lockEnabled) }
+            Section("Currency") {
+                Picker("Base currency", selection: $baseCurrency) { ForEach(CurrencyFormatter.supportedCodes, id: \.self) { Text($0) } }
+                    .onChange(of: baseCurrency) { value in
+                        if CurrencyFormatter.normalizedCode(value) == secondaryCurrency { secondaryCurrency = value == "IDR" ? "USD" : "IDR" }
+                    }
+                Picker("Secondary currency", selection: $secondaryCurrency) {
+                    Text("None").tag("")
+                    ForEach(CurrencyFormatter.supportedCodes.filter { $0 != CurrencyFormatter.normalizedCode(baseCurrency) }, id: \.self) { Text($0) }
+                }
+                TextField("USD/IDR rate", value: Binding(get: { exchangeRates.usdIDRRate }, set: { exchangeRates.setUSDIDRRate($0) }), format: .number)
+                    .keyboardType(.decimalPad)
+                Text("Source: \(exchangeRates.data.source)")
+                Text("Updated: \(exchangeRates.data.lastUpdated.formatted(date: .abbreviated, time: .shortened))")
+            }
             Section("Categories") { Button("Manage Categories") { showingCategories = true } }
             Section("Data") { Button("Export CSV") { shareItems = [BackupService.csv(accounts: Array(accounts), transactions: Array(transactions))] }; Button("Create JSON Backup") { shareItems = [BackupService.backup(accounts: Array(accounts), categories: Array(categories), transactions: Array(transactions))] }; Button("Restore JSON Backup") { restoring = true }; Button("Load Demo Data") { BackupService.demo(context: context) } }
         }.navigationTitle("Settings").sheet(isPresented: $showingCategories) { CategoriesView() }.sheet(isPresented: Binding(get: { !shareItems.isEmpty }, set: { if !$0 { shareItems = [] } })) { ActivityView(items: shareItems) }.sheet(isPresented: $restoring) { BackupPicker { url in BackupService.restore(from: url, context: context) } } }
@@ -365,15 +504,26 @@ struct BackupPicker: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UIDocumentPickerDelegate { let completion: (URL) -> Void; init(completion: @escaping (URL) -> Void) { self.completion = completion }; func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { if let url = urls.first { completion(url) } } }
 }
 
-struct Backup: Codable { var accounts: [BackupAccount]; var categories: [BackupCategory]; var transactions: [BackupTransaction] }
-struct BackupAccount: Codable { var id: UUID; var name: String; var kind: String; var currencyCode: String; var openingBalance: Decimal; var createdAt: Date }
+struct Backup: Codable {
+    var version: Int?
+    var accounts: [BackupAccount]
+    var categories: [BackupCategory]
+    var transactions: [BackupTransaction]
+    var settings: ReportingSettings?
+    var rateData: ExchangeRateData?
+
+    init(version: Int? = 2, accounts: [BackupAccount], categories: [BackupCategory], transactions: [BackupTransaction], settings: ReportingSettings? = nil, rateData: ExchangeRateData? = nil) {
+        self.version = version; self.accounts = accounts; self.categories = categories; self.transactions = transactions; self.settings = settings; self.rateData = rateData
+    }
+}
+struct BackupAccount: Codable { var id: UUID; var name: String; var kind: String; var currencyCode: String?; var openingBalance: Decimal; var createdAt: Date }
 struct BackupCategory: Codable { var id: UUID; var name: String; var kind: String }
 struct BackupTransaction: Codable { var id: UUID; var date: Date; var amount: Decimal; var note: String?; var kind: String; var transferID: UUID?; var investmentSymbol: String?; var investmentQuantity: Decimal?; var accountID: UUID; var categoryID: UUID? }
 
 enum BackupService {
-    static func backup(accounts: [Account], categories: [Category], transactions: [FinancialTransaction]) -> URL { let value = Backup(accounts: accounts.map { BackupAccount(id: $0.id, name: $0.name, kind: $0.kind, currencyCode: $0.currencyCode, openingBalance: $0.openingBalance.decimalValue, createdAt: $0.createdAt) }, categories: categories.map { BackupCategory(id: $0.id, name: $0.name, kind: $0.kind) }, transactions: transactions.map { BackupTransaction(id: $0.id, date: $0.date, amount: $0.amount.decimalValue, note: $0.note, kind: $0.kind, transferID: $0.transferID, investmentSymbol: $0.investmentSymbol, investmentQuantity: $0.investmentQuantity?.decimalValue, accountID: $0.account.id, categoryID: $0.category?.id) }); return write(try! JSONEncoder().encode(value), named: "MoneyManager-backup.json") }
-    static func csv(accounts: [Account], transactions: [FinancialTransaction]) -> URL { let rows = ["Date,Type,Account,Amount,Note"] + transactions.map { "\($0.date.formatted(date: .numeric, time: .omitted)),\($0.kind),\(quote($0.account.name)),\($0.amount.stringValue),\(quote($0.note ?? ""))" }; return write(rows.joined(separator: "\n").data(using: .utf8)!, named: "MoneyManager-transactions.csv") }
-    static func restore(from url: URL, context: NSManagedObjectContext) { guard url.startAccessingSecurityScopedResource() else { return }; defer { url.stopAccessingSecurityScopedResource() }; guard let value = try? JSONDecoder().decode(Backup.self, from: Data(contentsOf: url)) else { return }; context.performAndWait { let request = NSFetchRequest<NSFetchRequestResult>(entityName: "Transaction"); let delete = NSBatchDeleteRequest(fetchRequest: request); _ = try? context.execute(delete); ["Account", "Category"].forEach { name in let request = NSFetchRequest<NSFetchRequestResult>(entityName: name); _ = try? context.execute(NSBatchDeleteRequest(fetchRequest: request)) }; let accounts = Dictionary(uniqueKeysWithValues: value.accounts.map { item -> (UUID, Account) in let object = Account(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.currencyCode = item.currencyCode; object.openingBalance = NSDecimalNumber(decimal: item.openingBalance); object.createdAt = item.createdAt; return (item.id, object) }); let categories = Dictionary(uniqueKeysWithValues: value.categories.map { item -> (UUID, Category) in let object = Category(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; return (item.id, object) }); value.transactions.forEach { item in guard let account = accounts[item.accountID] else { return }; let object = FinancialTransaction(context: context); object.id = item.id; object.date = item.date; object.amount = NSDecimalNumber(decimal: item.amount); object.note = item.note; object.kind = item.kind; object.transferID = item.transferID; object.investmentSymbol = item.investmentSymbol; object.investmentQuantity = item.investmentQuantity.map(NSDecimalNumber.init(decimal:)); object.account = account; object.category = item.categoryID.flatMap { categories[$0] } }; try? context.save() } }
+    static func backup(accounts: [Account], categories: [Category], transactions: [FinancialTransaction], settings: ReportingSettings = .current(), rateData: ExchangeRateData = ExchangeRateService.shared.data) -> URL { let value = Backup(version: 2, accounts: accounts.map { BackupAccount(id: $0.id, name: $0.name, kind: $0.kind, currencyCode: $0.currencyCode, openingBalance: $0.openingBalance.decimalValue, createdAt: $0.createdAt) }, categories: categories.map { BackupCategory(id: $0.id, name: $0.name, kind: $0.kind) }, transactions: transactions.map { BackupTransaction(id: $0.id, date: $0.date, amount: $0.amount.decimalValue, note: $0.note, kind: $0.kind, transferID: $0.transferID, investmentSymbol: $0.investmentSymbol, investmentQuantity: $0.investmentQuantity?.decimalValue, accountID: $0.account.id, categoryID: $0.category?.id) }, settings: settings, rateData: rateData); return write(try! JSONEncoder().encode(value), named: "MoneyManager-backup.json") }
+    static func csv(accounts: [Account], transactions: [FinancialTransaction]) -> URL { let rows = ["Date,Type,Account,Currency,Amount,Note"] + transactions.map { "\($0.date.formatted(date: .numeric, time: .omitted)),\($0.kind),\(quote($0.account.name)),\($0.account.currencyCode),\($0.amount.stringValue),\(quote($0.note ?? ""))" }; return write(rows.joined(separator: "\n").data(using: .utf8)!, named: "MoneyManager-transactions.csv") }
+    static func restore(from url: URL, context: NSManagedObjectContext) { guard url.startAccessingSecurityScopedResource() else { return }; defer { url.stopAccessingSecurityScopedResource() }; guard let value = try? JSONDecoder().decode(Backup.self, from: Data(contentsOf: url)) else { return }; value.settings?.save(); if let rateData = value.rateData { ExchangeRateService.shared.restore(rateData) }; context.performAndWait { let request = NSFetchRequest<NSFetchRequestResult>(entityName: "Transaction"); let delete = NSBatchDeleteRequest(fetchRequest: request); _ = try? context.execute(delete); ["Account", "Category"].forEach { name in let request = NSFetchRequest<NSFetchRequestResult>(entityName: name); _ = try? context.execute(NSBatchDeleteRequest(fetchRequest: request)) }; let accounts = Dictionary(uniqueKeysWithValues: value.accounts.map { item -> (UUID, Account) in let object = Account(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.currencyCode = CurrencyFormatter.normalizedCode(item.currencyCode); object.openingBalance = NSDecimalNumber(decimal: item.openingBalance); object.createdAt = item.createdAt; return (item.id, object) }); let categories = Dictionary(uniqueKeysWithValues: value.categories.map { item -> (UUID, Category) in let object = Category(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; return (item.id, object) }); value.transactions.forEach { item in guard let account = accounts[item.accountID] else { return }; let object = FinancialTransaction(context: context); object.id = item.id; object.date = item.date; object.amount = NSDecimalNumber(decimal: item.amount); object.note = item.note; object.kind = item.kind; object.transferID = item.transferID; object.investmentSymbol = item.investmentSymbol; object.investmentQuantity = item.investmentQuantity.map(NSDecimalNumber.init(decimal:)); object.account = account; object.category = item.categoryID.flatMap { categories[$0] } }; try? context.save() } }
     static func demo(context: NSManagedObjectContext) { guard (try? context.count(for: NSFetchRequest<Account>(entityName: "Account"))) == 0 else { return }; let checking = Account(context: context); checking.id = UUID(); checking.name = "Checking"; checking.kind = "Checking"; checking.currencyCode = "USD"; checking.openingBalance = 1200; checking.createdAt = Date(); let groceries = Category(context: context); groceries.id = UUID(); groceries.name = "Groceries"; groceries.kind = "expense"; let salary = Category(context: context); salary.id = UUID(); salary.name = "Salary"; salary.kind = "income"; [(-65 as Decimal, "Groceries", groceries, "expense"), (2400, "Paycheck", salary, "income")].forEach { amount, note, category, kind in let transaction = FinancialTransaction(context: context); transaction.id = UUID(); transaction.account = checking; transaction.amount = NSDecimalNumber(decimal: amount); transaction.note = note; transaction.category = category; transaction.kind = kind; transaction.date = Date() }; try? context.save() }
     private static func write(_ data: Data, named: String) -> URL { let url = FileManager.default.temporaryDirectory.appendingPathComponent(named); try? data.write(to: url, options: .atomic); return url }
     private static func quote(_ value: String) -> String { "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\"" }
