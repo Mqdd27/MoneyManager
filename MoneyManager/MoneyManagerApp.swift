@@ -25,15 +25,15 @@ final class PersistenceController {
         let account = NSEntityDescription()
         account.name = "Account"
         account.managedObjectClassName = NSStringFromClass(Account.self)
-        account.properties = [attribute("id", .UUIDAttributeType), attribute("name", .stringAttributeType), attribute("kind", .stringAttributeType), attribute("currencyCode", .stringAttributeType), attribute("openingBalance", .decimalAttributeType), attribute("createdAt", .dateAttributeType)]
+        account.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("name", .stringAttributeType), Self.attribute("kind", .stringAttributeType), Self.attribute("currencyCode", .stringAttributeType), Self.attribute("openingBalance", .decimalAttributeType), Self.attribute("createdAt", .dateAttributeType)]
         let category = NSEntityDescription()
         category.name = "Category"
         category.managedObjectClassName = NSStringFromClass(Category.self)
-        category.properties = [attribute("id", .UUIDAttributeType), attribute("name", .stringAttributeType), attribute("kind", .stringAttributeType)]
+        category.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("name", .stringAttributeType), Self.attribute("kind", .stringAttributeType)]
         let transaction = NSEntityDescription()
         transaction.name = "Transaction"
         transaction.managedObjectClassName = NSStringFromClass(FinancialTransaction.self)
-        transaction.properties = [attribute("id", .UUIDAttributeType), attribute("date", .dateAttributeType), attribute("amount", .decimalAttributeType), attribute("note", .stringAttributeType, optional: true), attribute("kind", .stringAttributeType), attribute("transferID", .UUIDAttributeType, optional: true), attribute("investmentSymbol", .stringAttributeType, optional: true), attribute("investmentQuantity", .decimalAttributeType, optional: true), relationship("account", account), relationship("category", category, optional: true)]
+        transaction.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("date", .dateAttributeType), Self.attribute("amount", .decimalAttributeType), Self.attribute("note", .stringAttributeType, optional: true), Self.attribute("kind", .stringAttributeType), Self.attribute("transferID", .UUIDAttributeType, optional: true), Self.attribute("investmentSymbol", .stringAttributeType, optional: true), Self.attribute("investmentQuantity", .decimalAttributeType, optional: true), Self.relationship("account", account), Self.relationship("category", category, optional: true)]
         model.entities = [account, category, transaction]
         container = NSPersistentContainer(name: "MoneyManager", managedObjectModel: model)
         if inMemory { container.persistentStoreDescriptions.first?.url = URL(fileURLWithPath: "/dev/null") }
@@ -43,11 +43,11 @@ final class PersistenceController {
         container.viewContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy
     }
 
-    private func attribute(_ name: String, _ type: NSAttributeType, optional: Bool = false) -> NSAttributeDescription {
+    private static func attribute(_ name: String, _ type: NSAttributeType, optional: Bool = false) -> NSAttributeDescription {
         let value = NSAttributeDescription(); value.name = name; value.attributeType = type; value.isOptional = optional; return value
     }
 
-    private func relationship(_ name: String, _ destination: NSEntityDescription, optional: Bool = false) -> NSRelationshipDescription {
+    private static func relationship(_ name: String, _ destination: NSEntityDescription, optional: Bool = false) -> NSRelationshipDescription {
         let value = NSRelationshipDescription(); value.name = name; value.destinationEntity = destination; value.minCount = optional ? 0 : 1; value.maxCount = 1; value.deleteRule = .nullifyDeleteRule; value.isOptional = optional; return value
     }
 }
@@ -164,12 +164,38 @@ struct MainTabView: View {
 struct DashboardView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Account.createdAt, ascending: true)]) private var accounts: FetchedResults<Account>
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
+    private var cashFlow: (income: Decimal, expense: Decimal) { FinancialCalculator.cashFlow(Array(transactions)) }
+
     var body: some View {
-        NavigationView { List {
-            Section("Net Worth") { Text(FinancialCalculator.netWorth(accounts: Array(accounts), transactions: Array(transactions)), format: .currency(code: "USD")).font(.title2).fontWeight(.semibold) }
-            Section("Cash Flow") { let flow = FinancialCalculator.cashFlow(Array(transactions)); LabeledContent("Income", value: flow.income, format: .currency(code: "USD")); LabeledContent("Expenses", value: flow.expense, format: .currency(code: "USD")) }
-            Section("Recent Activity") { ForEach(transactions.prefix(5)) { TransactionRow(transaction: $0) } }
-        }.navigationTitle("Dashboard") }
+        NavigationView {
+            List {
+                Section(header: Text("Net Worth")) {
+                    Text(FinancialCalculator.netWorth(accounts: Array(accounts), transactions: Array(transactions)), format: .currency(code: "USD")).font(.title2).fontWeight(.semibold)
+                }
+                Section(header: Text("Cash Flow")) {
+                    ValueRow(title: "Income", value: cashFlow.income, currencyCode: "USD")
+                    ValueRow(title: "Expenses", value: cashFlow.expense, currencyCode: "USD")
+                }
+                Section(header: Text("Recent Activity")) {
+                    ForEach(transactions.prefix(5)) { TransactionRow(transaction: $0) }
+                }
+            }
+            .navigationTitle("Dashboard")
+        }
+    }
+}
+
+struct ValueRow: View {
+    let title: String
+    let value: Decimal
+    let currencyCode: String
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value, format: .currency(code: currencyCode))
+        }
     }
 }
 
@@ -181,7 +207,9 @@ struct AccountsView: View {
     var body: some View {
         NavigationView { List {
             if accounts.isEmpty { EmptyState(title: "No Accounts", image: "building.columns", detail: "Add an account to start tracking your money.") }
-            ForEach(accounts) { account in LabeledContent(account.name, value: FinancialCalculator.balance(account: account, transactions: Array(transactions)), format: .currency(code: account.currencyCode)) }
+            ForEach(accounts) { account in
+                ValueRow(title: account.name, value: FinancialCalculator.balance(account: account, transactions: Array(transactions)), currencyCode: account.currencyCode)
+            }
                 .onDelete { indexes in indexes.map { accounts[$0] }.forEach { account in transactions.filter { $0.account == account }.forEach(context.delete); context.delete(account) }; try? context.save() }
         }.navigationTitle("Accounts").toolbar { Button(action: { showingAdd = true }) { Label("Add Account", systemImage: "plus") } }.sheet(isPresented: $showingAdd) { AccountEditor() } }
     }
@@ -266,8 +294,25 @@ struct TransactionEditor: View {
 
 struct PortfolioView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
+    private var holdings: [String: Decimal] { FinancialCalculator.holdings(Array(transactions)) }
+
     var body: some View {
-        NavigationView { List { let holdings = FinancialCalculator.holdings(Array(transactions)); if holdings.isEmpty { EmptyState(title: "No Holdings", image: "chart.pie", detail: "Record an investment purchase to track holdings.") } else { ForEach(holdings.keys.sorted(), id: \.self) { symbol in LabeledContent(symbol, value: holdings[symbol]!, format: .number) } } }.navigationTitle("Portfolio") }
+        NavigationView {
+            List {
+                if holdings.isEmpty {
+                    EmptyState(title: "No Holdings", image: "chart.pie", detail: "Record an investment purchase to track holdings.")
+                } else {
+                    ForEach(holdings.keys.sorted(), id: \.self) { symbol in
+                        HStack {
+                            Text(symbol)
+                            Spacer()
+                            Text(NSDecimalNumber(decimal: holdings[symbol]!).stringValue)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Portfolio")
+        }
     }
 }
 
