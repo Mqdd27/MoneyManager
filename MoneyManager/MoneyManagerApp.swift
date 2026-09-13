@@ -34,7 +34,15 @@ final class PersistenceController {
         transaction.name = "Transaction"
         transaction.managedObjectClassName = NSStringFromClass(FinancialTransaction.self)
         transaction.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("date", .dateAttributeType), Self.attribute("amount", .decimalAttributeType), Self.attribute("note", .stringAttributeType, optional: true), Self.attribute("kind", .stringAttributeType), Self.attribute("transferID", .UUIDAttributeType, optional: true), Self.attribute("investmentSymbol", .stringAttributeType, optional: true), Self.attribute("investmentQuantity", .decimalAttributeType, optional: true), Self.attribute("isDemoData", .booleanAttributeType, defaultValue: false), Self.relationship("account", account), Self.relationship("category", category, optional: true)]
-        model.entities = [account, category, transaction]
+        let quote = NSEntityDescription()
+        quote.name = "MarketQuote"
+        quote.managedObjectClassName = NSStringFromClass(MarketQuote.self)
+        quote.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("symbol", .stringAttributeType), Self.attribute("currencyCode", .stringAttributeType, defaultValue: "USD"), Self.attribute("price", .decimalAttributeType), Self.attribute("updatedAt", .dateAttributeType), Self.attribute("source", .stringAttributeType, defaultValue: "Manual"), Self.attribute("assetType", .stringAttributeType, defaultValue: "Equity"), Self.attribute("isManual", .booleanAttributeType, defaultValue: true)]
+        let snapshot = NSEntityDescription()
+        snapshot.name = "NetWorthSnapshot"
+        snapshot.managedObjectClassName = NSStringFromClass(NetWorthSnapshot.self)
+        snapshot.properties = [Self.attribute("id", .UUIDAttributeType), Self.attribute("date", .dateAttributeType), Self.attribute("currencyCode", .stringAttributeType), Self.attribute("cashValue", .decimalAttributeType), Self.attribute("investmentValue", .decimalAttributeType), Self.attribute("totalValue", .decimalAttributeType), Self.attribute("unconvertibleCount", .integer16AttributeType, defaultValue: 0)]
+        model.entities = [account, category, transaction, quote, snapshot]
         container = NSPersistentContainer(name: "MoneyManager", managedObjectModel: model)
         container.persistentStoreDescriptions.forEach { description in
             description.shouldMigrateStoreAutomatically = true
@@ -75,6 +83,8 @@ final class PersistenceController {
 extension Account: Identifiable {}
 extension Category: Identifiable {}
 extension FinancialTransaction: Identifiable {}
+extension MarketQuote: Identifiable {}
+extension NetWorthSnapshot: Identifiable {}
 
 @objc(Account) final class Account: NSManagedObject {
     @NSManaged var id: UUID; @NSManaged var name: String; @NSManaged var kind: String; @NSManaged var currencyCode: String; @NSManaged var openingBalance: NSDecimalNumber; @NSManaged var createdAt: Date; @NSManaged var institution: String; @NSManaged var notes: String; @NSManaged var updatedAt: Date; @NSManaged var isArchived: Bool; @NSManaged var isDemoData: Bool
@@ -88,10 +98,19 @@ extension FinancialTransaction: Identifiable {}
     @NSManaged var id: UUID; @NSManaged var date: Date; @NSManaged var amount: NSDecimalNumber; @NSManaged var note: String?; @NSManaged var kind: String; @NSManaged var transferID: UUID?; @NSManaged var investmentSymbol: String?; @NSManaged var investmentQuantity: NSDecimalNumber?; @NSManaged var isDemoData: Bool; @NSManaged var account: Account; @NSManaged var category: Category?
 }
 
+@objc(MarketQuote) final class MarketQuote: NSManagedObject {
+    @NSManaged var id: UUID; @NSManaged var symbol: String; @NSManaged var currencyCode: String; @NSManaged var price: NSDecimalNumber; @NSManaged var updatedAt: Date; @NSManaged var source: String; @NSManaged var assetType: String; @NSManaged var isManual: Bool
+}
+
+@objc(NetWorthSnapshot) final class NetWorthSnapshot: NSManagedObject {
+    @NSManaged var id: UUID; @NSManaged var date: Date; @NSManaged var currencyCode: String; @NSManaged var cashValue: NSDecimalNumber; @NSManaged var investmentValue: NSDecimalNumber; @NSManaged var totalValue: NSDecimalNumber; @NSManaged var unconvertibleCount: Int16
+}
+
 enum TransactionKind: String, CaseIterable, Identifiable {
-    case income, expense, transfer, investmentBuy, investmentSell
+    case income, expense, transfer, investmentBuy, investmentSell, investmentDividend, investmentFee, investmentDeposit, investmentWithdrawal
     var id: String { rawValue }
-    var title: String { switch self { case .income: return "Income"; case .expense: return "Expense"; case .transfer: return "Transfer"; case .investmentBuy: return "Buy investment"; case .investmentSell: return "Sell investment" } }
+    var title: String { switch self { case .income: return "Income"; case .expense: return "Expense"; case .transfer: return "Transfer"; case .investmentBuy: return "Buy investment"; case .investmentSell: return "Sell investment"; case .investmentDividend: return "Investment dividend"; case .investmentFee: return "Investment fee"; case .investmentDeposit: return "Investment deposit"; case .investmentWithdrawal: return "Investment withdrawal" } }
+    var isInvestmentAction: Bool { [.investmentBuy, .investmentSell, .investmentDividend, .investmentFee, .investmentDeposit, .investmentWithdrawal].contains(self) }
 }
 
 struct CurrencyDefinition: Codable, Equatable, Identifiable {
@@ -225,13 +244,56 @@ struct FinancialCalculator {
         }
     }
 
-    static func holdings(_ transactions: [FinancialTransaction]) -> [String: Decimal] {
-        transactions.reduce(into: [:]) { result, transaction in
-            guard let symbol = transaction.investmentSymbol, let quantity = transaction.investmentQuantity?.decimalValue else { return }
-            result[symbol, default: .zero] += transaction.kind == TransactionKind.investmentSell.rawValue ? -quantity : quantity
+    static func holdings(_ transactions: [FinancialTransaction]) -> [String: Decimal] { Dictionary(uniqueKeysWithValues: investmentPositions(transactions).map { ($0.symbol, $0.quantity) }) }
+
+    static func investmentPositions(_ transactions: [FinancialTransaction], quotes: [MarketQuote] = []) -> [InvestmentPosition] {
+        let grouped = Dictionary(grouping: transactions.compactMap { transaction -> FinancialTransaction? in TransactionKind(rawValue: transaction.kind)?.isInvestmentAction == true && transaction.investmentSymbol != nil ? transaction : nil }, by: { $0.investmentSymbol!.uppercased() })
+        return grouped.keys.sorted().map { symbol in
+            var quantity = Decimal.zero, cost = Decimal.zero, realized = Decimal.zero
+            for transaction in grouped[symbol]!.sorted(by: { $0.date < $1.date }) {
+                let amount = abs(transaction.amount.decimalValue), units = transaction.investmentQuantity?.decimalValue ?? 0
+                switch transaction.kind {
+                case TransactionKind.investmentBuy.rawValue: quantity += units; cost += amount
+                case TransactionKind.investmentSell.rawValue:
+                    let sold = min(units, quantity), basis = quantity == 0 ? 0 : cost * sold / quantity
+                    quantity -= sold; cost -= basis; realized += amount - basis
+                case TransactionKind.investmentFee.rawValue: cost += amount
+                case TransactionKind.investmentDividend.rawValue: realized += amount
+                default: break
+                }
+            }
+            let quote = quotes.first { $0.symbol.uppercased() == symbol }
+            return InvestmentPosition(symbol: symbol, currencyCode: quote?.currencyCode ?? grouped[symbol]!.first!.account.currencyCode, quantity: quantity, remainingCost: cost, realizedProfitLoss: realized, quote: quote?.price.decimalValue, quoteUpdatedAt: quote?.updatedAt)
         }
     }
+
+    static func cashBalance(account: Account, transactions: [FinancialTransaction]) -> Decimal {
+        let excluded: Set<String> = [TransactionKind.investmentBuy.rawValue, TransactionKind.investmentSell.rawValue, TransactionKind.investmentDeposit.rawValue, TransactionKind.investmentWithdrawal.rawValue]
+        return transactions.filter { $0.account.objectID == account.objectID && !excluded.contains($0.kind) }.reduce(account.openingBalance.decimalValue) { $0 + $1.amount.decimalValue }
+    }
+
+    static func netWorthResult(accounts: [Account], transactions: [FinancialTransaction], quotes: [MarketQuote], currencyCode: String, rates: ExchangeRateService = .shared) -> NetWorthResult {
+        var cash = Decimal.zero, investments = Decimal.zero, missing = 0
+        for account in accounts { if let value = rates.convert(cashBalance(account: account, transactions: transactions), from: account.currencyCode, to: currencyCode) { cash += value } else { missing += 1 } }
+        for position in investmentPositions(transactions, quotes: quotes) where position.quantity != 0 {
+            guard let value = position.marketValue, let converted = rates.convert(value, from: position.currencyCode, to: currencyCode) else { missing += 1; continue }; investments += converted
+        }
+        return NetWorthResult(cash: cash, investments: investments, unconvertibleCount: missing)
+    }
 }
+
+struct InvestmentPosition: Equatable, Identifiable {
+    let symbol: String; let currencyCode: String; let quantity: Decimal; let remainingCost: Decimal; let realizedProfitLoss: Decimal; let quote: Decimal?; let quoteUpdatedAt: Date?
+    var id: String { symbol }; var averageCost: Decimal { quantity == 0 ? 0 : remainingCost / quantity }; var marketValue: Decimal? { quote.map { quantity * $0 } }; var unrealizedProfitLoss: Decimal? { marketValue.map { $0 - remainingCost } }
+}
+struct NetWorthResult: Equatable { let cash: Decimal; let investments: Decimal; let unconvertibleCount: Int; var total: Decimal { cash + investments } }
+protocol MarketPriceService { func quote(symbol: String, in context: NSManagedObjectContext) -> MarketQuote?; func saveManual(symbol: String, assetType: String, currencyCode: String, price: Decimal, updatedAt: Date, in context: NSManagedObjectContext) }
+final class PersistentMarketPriceService: MarketPriceService {
+    static let shared = PersistentMarketPriceService()
+    func quote(symbol: String, in context: NSManagedObjectContext) -> MarketQuote? { let request = NSFetchRequest<MarketQuote>(entityName: "MarketQuote"); request.predicate = NSPredicate(format: "symbol ==[c] %@", symbol); return try? context.fetch(request).first }
+    func saveManual(symbol: String, assetType: String = "Equity", currencyCode: String, price: Decimal, updatedAt: Date = Date(), in context: NSManagedObjectContext) { let object = quote(symbol: symbol, in: context) ?? MarketQuote(context: context); if object.isInserted { object.id = UUID() }; object.symbol = symbol.uppercased(); object.assetType = assetType; object.currencyCode = CurrencyFormatter.normalizedCode(currencyCode); object.price = NSDecimalNumber(decimal: price); object.updatedAt = updatedAt; object.source = "Manual"; object.isManual = true; try? context.save() }
+}
+enum NetWorthSnapshotService { static func save(_ result: NetWorthResult, currencyCode: String, date: Date = Date(), in context: NSManagedObjectContext) { let day = Calendar.current.startOfDay(for: date), code = CurrencyFormatter.normalizedCode(currencyCode); let request = NSFetchRequest<NetWorthSnapshot>(entityName: "NetWorthSnapshot"); request.predicate = NSPredicate(format: "date == %@ AND currencyCode == %@", day as NSDate, code); let snapshot = (try? context.fetch(request).first) ?? NetWorthSnapshot(context: context); if snapshot.isInserted { snapshot.id = UUID() }; snapshot.date = day; snapshot.currencyCode = code; snapshot.cashValue = NSDecimalNumber(decimal: result.cash); snapshot.investmentValue = NSDecimalNumber(decimal: result.investments); snapshot.totalValue = NSDecimalNumber(decimal: result.total); snapshot.unconvertibleCount = Int16(result.unconvertibleCount); try? context.save() } }
 
 enum DemoDataService {
     static func hasDemoData(in context: NSManagedObjectContext) -> Bool {
@@ -272,6 +334,8 @@ enum DemoDataService {
         try fetch(FinancialTransaction.self, in: context).forEach(context.delete)
         try fetch(Account.self, in: context).forEach(context.delete)
         try fetch(Category.self, in: context).forEach(context.delete)
+        try fetch(MarketQuote.self, in: context).forEach(context.delete)
+        try fetch(NetWorthSnapshot.self, in: context).forEach(context.delete)
         try context.save()
     }
 
@@ -348,6 +412,8 @@ struct MainTabView: View {
 struct DashboardView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Account.createdAt, ascending: true)]) private var accounts: FetchedResults<Account>
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
+    @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \MarketQuote.symbol, ascending: true)]) private var quotes: FetchedResults<MarketQuote>
+    @Environment(\.managedObjectContext) private var context
     @AppStorage("reportingBaseCurrency") private var baseCurrency = "IDR"
     @AppStorage("reportingSecondaryCurrency") private var secondaryCurrency = "USD"
     private var reportingCurrency: String { CurrencyFormatter.normalizedCode(baseCurrency) }
@@ -358,17 +424,18 @@ struct DashboardView: View {
         NavigationView {
             List {
                 Section(header: Text("Currency")) {
-                    Picker("Reporting currency", selection: $baseCurrency) {
-                        Text("IDR").tag("IDR")
-                        Text("USD").tag("USD")
-                    }
+                    Picker("Reporting currency", selection: $baseCurrency) { ForEach(["IDR", "USD", "SGD", "CNY"], id: \.self) { Text($0).tag($0) } }
                     .pickerStyle(.segmented)
                     .onChange(of: baseCurrency) { value in secondaryCurrency = CurrencyFormatter.normalizedCode(value) == "IDR" ? "USD" : "IDR" }
                 }
                 Section(header: Text("Net Worth")) {
-                    let total = FinancialCalculator.netWorth(accounts: Array(accounts), transactions: Array(transactions), currencyCode: reportingCurrency)
-                    Text(CurrencyFormatter.string(total, code: reportingCurrency)).font(.title2).fontWeight(.semibold)
-                    if let secondary = secondaryReportingCurrency, let converted = ExchangeRateService.shared.convert(total, from: reportingCurrency, to: secondary) { Text("Approx. " + CurrencyFormatter.string(converted, code: secondary)).foregroundColor(.secondary) }
+                    let result = FinancialCalculator.netWorthResult(accounts: Array(accounts), transactions: Array(transactions), quotes: Array(quotes), currencyCode: reportingCurrency)
+                    Text(CurrencyFormatter.string(result.total, code: reportingCurrency)).font(.title2).fontWeight(.semibold)
+                    ValueRow(title: "Cash", value: result.cash, currencyCode: reportingCurrency)
+                    ValueRow(title: "Investments", value: result.investments, currencyCode: reportingCurrency)
+                    if result.unconvertibleCount > 0 { Text("\(result.unconvertibleCount) value(s) excluded because no conversion or quote is available.").foregroundColor(.orange) }
+                    Button("Save Today’s Snapshot") { NetWorthSnapshotService.save(result, currencyCode: reportingCurrency, in: context) }
+                    if let secondary = secondaryReportingCurrency, let converted = ExchangeRateService.shared.convert(result.total, from: reportingCurrency, to: secondary) { Text("Approx. " + CurrencyFormatter.string(converted, code: secondary)).foregroundColor(.secondary) }
                 }
                 Section(header: Text("Cash Flow")) {
                     ValueRow(title: "Income", value: cashFlow.income, currencyCode: reportingCurrency)
@@ -514,27 +581,37 @@ struct TransactionEditor: View {
 }
 
 struct PortfolioView: View {
+    @Environment(\.managedObjectContext) private var context
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
-    private var holdings: [String: Decimal] { FinancialCalculator.holdings(Array(transactions)) }
+    @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \MarketQuote.symbol, ascending: true)]) private var quotes: FetchedResults<MarketQuote>
+    @AppStorage("reportingBaseCurrency") private var baseCurrency = "IDR"
+    @State private var editingSymbol = ""; @State private var showingQuoteEditor = false
+    private var positions: [InvestmentPosition] { FinancialCalculator.investmentPositions(Array(transactions), quotes: Array(quotes)).filter { $0.quantity != 0 } }
+    private var report: NetWorthResult { FinancialCalculator.netWorthResult(accounts: [], transactions: Array(transactions), quotes: Array(quotes), currencyCode: CurrencyFormatter.normalizedCode(baseCurrency)) }
 
     var body: some View {
-        NavigationView {
-            List {
-                if holdings.isEmpty {
-                    EmptyState(title: "No Holdings", image: "chart.pie", detail: "Record an investment purchase to track holdings.")
-                } else {
-                    ForEach(holdings.keys.sorted(), id: \.self) { symbol in
-                        HStack {
-                            Text(symbol)
-                            Spacer()
-                            Text(NSDecimalNumber(decimal: holdings[symbol]!).stringValue)
-                        }
-                    }
+        NavigationView { List {
+            if positions.isEmpty { EmptyState(title: "No Holdings", image: "chart.pie", detail: "Record an investment purchase to track holdings.") }
+            ForEach(positions) { position in
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack { Text(position.symbol).fontWeight(.semibold); Spacer(); Text(NSDecimalNumber(decimal: position.quantity).stringValue) }
+                    Text("Cost " + CurrencyFormatter.string(position.remainingCost, code: position.currencyCode) + " · Avg " + CurrencyFormatter.string(position.averageCost, code: position.currencyCode)).font(.caption).foregroundColor(.secondary)
+                    if let value = position.marketValue { Text("Value " + CurrencyFormatter.string(value, code: position.currencyCode) + " · Unrealized " + CurrencyFormatter.string(position.unrealizedProfitLoss!, code: position.currencyCode)).font(.caption) } else { Text("No manual quote").font(.caption).foregroundColor(.orange) }
+                    if let updated = position.quoteUpdatedAt { Text("Manual quote · " + (Date().timeIntervalSince(updated) <= 900 ? "Fresh" : "Stale") + " · " + updated.formatted(date: .abbreviated, time: .shortened)).font(.caption2).foregroundColor(Date().timeIntervalSince(updated) <= 900 ? .secondary : .orange) }
+                    Button("Set Manual Quote") { editingSymbol = position.symbol; showingQuoteEditor = true }
                 }
             }
-            .navigationTitle("Portfolio")
-        }
+            if !positions.isEmpty { Section("Reporting total") { Text(CurrencyFormatter.string(report.investments, code: CurrencyFormatter.normalizedCode(baseCurrency))) } }
+        }.navigationTitle("Portfolio").sheet(isPresented: $showingQuoteEditor) { QuoteEditor(symbol: editingSymbol) } }
     }
+}
+
+struct QuoteEditor: View {
+    @Environment(\.managedObjectContext) private var context
+    @Environment(\.dismiss) private var dismiss
+    let symbol: String
+    @State private var price = ""; @State private var currencyCode = "USD"
+    var body: some View { NavigationView { Form { TextField("Price", text: $price).keyboardType(.decimalPad); Picker("Currency", selection: $currencyCode) { ForEach(CurrencyFormatter.supportedCodes, id: \.self) { Text($0) } } }.navigationTitle(symbol + " Quote").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Save") { if let value = DecimalInputParser.parse(price), value >= 0 { PersistentMarketPriceService.shared.saveManual(symbol: symbol, currencyCode: currencyCode, price: value, in: context); dismiss() } }.disabled(DecimalInputParser.parse(price) == nil) } } }.onAppear { if let quote = PersistentMarketPriceService.shared.quote(symbol: symbol, in: context) { price = quote.price.stringValue; currencyCode = quote.currencyCode } } }
 }
 
 struct SettingsView: View {
@@ -546,6 +623,8 @@ struct SettingsView: View {
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Account.name, ascending: true)]) private var accounts: FetchedResults<Account>
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \Category.name, ascending: true)]) private var categories: FetchedResults<Category>
     @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
+    @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \MarketQuote.symbol, ascending: true)]) private var quotes: FetchedResults<MarketQuote>
+    @FetchRequest(sortDescriptors: [NSSortDescriptor(keyPath: \NetWorthSnapshot.date, ascending: false)]) private var snapshots: FetchedResults<NetWorthSnapshot>
     @State private var showingCategories = false
     @State private var shareItems: [Any] = []
     @State private var restoring = false
@@ -572,7 +651,7 @@ struct SettingsView: View {
             Section("Categories") { Button("Manage Categories") { showingCategories = true } }
             Section("Data") {
                 Button("Export CSV") { shareItems = [BackupService.csv(accounts: Array(accounts), transactions: Array(transactions))] }
-                Button("Create JSON Backup") { shareItems = [BackupService.backup(accounts: Array(accounts), categories: Array(categories), transactions: Array(transactions))] }
+                Button("Create JSON Backup") { shareItems = [BackupService.backup(accounts: Array(accounts), categories: Array(categories), transactions: Array(transactions), quotes: Array(quotes), snapshots: Array(snapshots))] }
                 Button("Restore JSON Backup") { restoring = true }
                 Button(DemoDataService.hasDemoData(in: context) ? "Reload Demo Data" : "Load Demo Data") {
                     if DemoDataService.hasDemoData(in: context) { try? DemoDataService.remove(in: context) }
@@ -624,9 +703,11 @@ struct Backup: Codable {
     var settings: ReportingSettings?
     var rateData: ExchangeRateData?
     var ratePairs: [ExchangeRatePair]?
+    var quotes: [BackupQuote]?
+    var snapshots: [BackupSnapshot]?
 
-    init(version: Int? = 3, accounts: [BackupAccount], categories: [BackupCategory], transactions: [BackupTransaction], settings: ReportingSettings? = nil, rateData: ExchangeRateData? = nil, ratePairs: [ExchangeRatePair]? = nil) {
-        self.version = version; self.accounts = accounts; self.categories = categories; self.transactions = transactions; self.settings = settings; self.rateData = rateData; self.ratePairs = ratePairs
+    init(version: Int? = 3, accounts: [BackupAccount], categories: [BackupCategory], transactions: [BackupTransaction], settings: ReportingSettings? = nil, rateData: ExchangeRateData? = nil, ratePairs: [ExchangeRatePair]? = nil, quotes: [BackupQuote]? = nil, snapshots: [BackupSnapshot]? = nil) {
+        self.version = version; self.accounts = accounts; self.categories = categories; self.transactions = transactions; self.settings = settings; self.rateData = rateData; self.ratePairs = ratePairs; self.quotes = quotes; self.snapshots = snapshots
     }
 }
 struct BackupAccount: Codable {
@@ -639,6 +720,8 @@ struct BackupCategory: Codable {
     init(id: UUID, name: String, kind: String, isDemoData: Bool = false) { self.id = id; self.name = name; self.kind = kind; self.isDemoData = isDemoData }
     init(from decoder: Decoder) throws { let container = try decoder.container(keyedBy: CodingKeys.self); id = try container.decode(UUID.self, forKey: .id); name = try container.decode(String.self, forKey: .name); kind = try container.decode(String.self, forKey: .kind); isDemoData = try container.decodeIfPresent(Bool.self, forKey: .isDemoData) ?? false }
 }
+struct BackupQuote: Codable { var id: UUID; var symbol: String; var assetType: String; var currencyCode: String; var price: Decimal; var updatedAt: Date; var source: String; var isManual: Bool }
+struct BackupSnapshot: Codable { var id: UUID; var date: Date; var currencyCode: String; var cashValue: Decimal; var investmentValue: Decimal; var totalValue: Decimal; var unconvertibleCount: Int16 }
 struct BackupTransaction: Codable {
     var id: UUID; var date: Date; var amount: Decimal; var note: String?; var kind: String; var transferID: UUID?; var investmentSymbol: String?; var investmentQuantity: Decimal?; var accountID: UUID; var categoryID: UUID?; var isDemoData: Bool
     init(id: UUID, date: Date, amount: Decimal, note: String?, kind: String, transferID: UUID?, investmentSymbol: String?, investmentQuantity: Decimal?, accountID: UUID, categoryID: UUID?, isDemoData: Bool = false) { self.id = id; self.date = date; self.amount = amount; self.note = note; self.kind = kind; self.transferID = transferID; self.investmentSymbol = investmentSymbol; self.investmentQuantity = investmentQuantity; self.accountID = accountID; self.categoryID = categoryID; self.isDemoData = isDemoData }
@@ -646,9 +729,9 @@ struct BackupTransaction: Codable {
 }
 
 enum BackupService {
-    static func backup(accounts: [Account], categories: [Category], transactions: [FinancialTransaction], settings: ReportingSettings = .current(), rateData: ExchangeRateData = ExchangeRateService.shared.data) -> URL { let value = Backup(version: 3, accounts: accounts.map { BackupAccount(id: $0.id, name: $0.name, kind: $0.kind, currencyCode: $0.currencyCode, openingBalance: $0.openingBalance.decimalValue, createdAt: $0.createdAt, institution: $0.institution, notes: $0.notes, updatedAt: $0.updatedAt, isArchived: $0.isArchived, isDemoData: $0.isDemoData) }, categories: categories.map { BackupCategory(id: $0.id, name: $0.name, kind: $0.kind, isDemoData: $0.isDemoData) }, transactions: transactions.map { BackupTransaction(id: $0.id, date: $0.date, amount: $0.amount.decimalValue, note: $0.note, kind: $0.kind, transferID: $0.transferID, investmentSymbol: $0.investmentSymbol, investmentQuantity: $0.investmentQuantity?.decimalValue, accountID: $0.account.id, categoryID: $0.category?.id, isDemoData: $0.isDemoData) }, settings: settings, rateData: rateData, ratePairs: ExchangeRateService.shared.pairs); return write(try! JSONEncoder().encode(value), named: "MoneyManager-backup.json") }
+    static func backup(accounts: [Account], categories: [Category], transactions: [FinancialTransaction], quotes: [MarketQuote] = [], snapshots: [NetWorthSnapshot] = [], settings: ReportingSettings = .current(), rateData: ExchangeRateData = ExchangeRateService.shared.data) -> URL { let value = Backup(version: 4, accounts: accounts.map { BackupAccount(id: $0.id, name: $0.name, kind: $0.kind, currencyCode: $0.currencyCode, openingBalance: $0.openingBalance.decimalValue, createdAt: $0.createdAt, institution: $0.institution, notes: $0.notes, updatedAt: $0.updatedAt, isArchived: $0.isArchived, isDemoData: $0.isDemoData) }, categories: categories.map { BackupCategory(id: $0.id, name: $0.name, kind: $0.kind, isDemoData: $0.isDemoData) }, transactions: transactions.map { BackupTransaction(id: $0.id, date: $0.date, amount: $0.amount.decimalValue, note: $0.note, kind: $0.kind, transferID: $0.transferID, investmentSymbol: $0.investmentSymbol, investmentQuantity: $0.investmentQuantity?.decimalValue, accountID: $0.account.id, categoryID: $0.category?.id, isDemoData: $0.isDemoData) }, settings: settings, rateData: rateData, ratePairs: ExchangeRateService.shared.pairs, quotes: quotes.map { BackupQuote(id: $0.id, symbol: $0.symbol, assetType: $0.assetType, currencyCode: $0.currencyCode, price: $0.price.decimalValue, updatedAt: $0.updatedAt, source: $0.source, isManual: $0.isManual) }, snapshots: snapshots.map { BackupSnapshot(id: $0.id, date: $0.date, currencyCode: $0.currencyCode, cashValue: $0.cashValue.decimalValue, investmentValue: $0.investmentValue.decimalValue, totalValue: $0.totalValue.decimalValue, unconvertibleCount: $0.unconvertibleCount) }); return write(try! JSONEncoder().encode(value), named: "MoneyManager-backup.json") }
     static func csv(accounts: [Account], transactions: [FinancialTransaction]) -> URL { let rows = ["Date,Type,Account,Currency,Amount,Note"] + transactions.map { "\($0.date.formatted(date: .numeric, time: .omitted)),\($0.kind),\(quote($0.account.name)),\($0.account.currencyCode),\($0.amount.stringValue),\(quote($0.note ?? ""))" }; return write(rows.joined(separator: "\n").data(using: .utf8)!, named: "MoneyManager-transactions.csv") }
-    static func restore(from url: URL, context: NSManagedObjectContext) { guard url.startAccessingSecurityScopedResource() else { return }; defer { url.stopAccessingSecurityScopedResource() }; guard let value = try? JSONDecoder().decode(Backup.self, from: Data(contentsOf: url)) else { return }; value.settings?.save(); if let pairs = value.ratePairs { ExchangeRateService.shared.restore(pairs) } else if let rateData = value.rateData { ExchangeRateService.shared.restore(rateData) }; context.performAndWait { let request = NSFetchRequest<NSFetchRequestResult>(entityName: "Transaction"); let delete = NSBatchDeleteRequest(fetchRequest: request); _ = try? context.execute(delete); ["Account", "Category"].forEach { name in let request = NSFetchRequest<NSFetchRequestResult>(entityName: name); _ = try? context.execute(NSBatchDeleteRequest(fetchRequest: request)) }; let accounts = Dictionary(uniqueKeysWithValues: value.accounts.map { item -> (UUID, Account) in let object = Account(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.currencyCode = CurrencyFormatter.normalizedCode(item.currencyCode); object.openingBalance = NSDecimalNumber(decimal: item.openingBalance); object.createdAt = item.createdAt; object.institution = item.institution; object.notes = item.notes; object.updatedAt = item.updatedAt; object.isArchived = item.isArchived; object.isDemoData = item.isDemoData; return (item.id, object) }); let categories = Dictionary(uniqueKeysWithValues: value.categories.map { item -> (UUID, Category) in let object = Category(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.isDemoData = item.isDemoData; return (item.id, object) }); value.transactions.forEach { item in guard let account = accounts[item.accountID] else { return }; let object = FinancialTransaction(context: context); object.id = item.id; object.date = item.date; object.amount = NSDecimalNumber(decimal: item.amount); object.note = item.note; object.kind = item.kind; object.transferID = item.transferID; object.investmentSymbol = item.investmentSymbol; object.investmentQuantity = item.investmentQuantity.map(NSDecimalNumber.init(decimal:)); object.account = account; object.isDemoData = item.isDemoData; object.category = item.categoryID.flatMap { categories[$0] } }; try? context.save() } }
+    static func restore(from url: URL, context: NSManagedObjectContext) { guard url.startAccessingSecurityScopedResource() else { return }; defer { url.stopAccessingSecurityScopedResource() }; guard let value = try? JSONDecoder().decode(Backup.self, from: Data(contentsOf: url)) else { return }; value.settings?.save(); if let pairs = value.ratePairs { ExchangeRateService.shared.restore(pairs) } else if let rateData = value.rateData { ExchangeRateService.shared.restore(rateData) }; context.performAndWait { let request = NSFetchRequest<NSFetchRequestResult>(entityName: "Transaction"); let delete = NSBatchDeleteRequest(fetchRequest: request); _ = try? context.execute(delete); ["Account", "Category", "MarketQuote", "NetWorthSnapshot"].forEach { name in let request = NSFetchRequest<NSFetchRequestResult>(entityName: name); _ = try? context.execute(NSBatchDeleteRequest(fetchRequest: request)) }; let accounts = Dictionary(uniqueKeysWithValues: value.accounts.map { item -> (UUID, Account) in let object = Account(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.currencyCode = CurrencyFormatter.normalizedCode(item.currencyCode); object.openingBalance = NSDecimalNumber(decimal: item.openingBalance); object.createdAt = item.createdAt; object.institution = item.institution; object.notes = item.notes; object.updatedAt = item.updatedAt; object.isArchived = item.isArchived; object.isDemoData = item.isDemoData; return (item.id, object) }); let categories = Dictionary(uniqueKeysWithValues: value.categories.map { item -> (UUID, Category) in let object = Category(context: context); object.id = item.id; object.name = item.name; object.kind = item.kind; object.isDemoData = item.isDemoData; return (item.id, object) }); value.transactions.forEach { item in guard let account = accounts[item.accountID] else { return }; let object = FinancialTransaction(context: context); object.id = item.id; object.date = item.date; object.amount = NSDecimalNumber(decimal: item.amount); object.note = item.note; object.kind = item.kind; object.transferID = item.transferID; object.investmentSymbol = item.investmentSymbol; object.investmentQuantity = item.investmentQuantity.map(NSDecimalNumber.init(decimal:)); object.account = account; object.isDemoData = item.isDemoData; object.category = item.categoryID.flatMap { categories[$0] } }; try? context.save() } }
     static func demo(context: NSManagedObjectContext) { try? DemoDataService.load(in: context) }
     private static func write(_ data: Data, named: String) -> URL { let url = FileManager.default.temporaryDirectory.appendingPathComponent(named); try? data.write(to: url, options: .atomic); return url }
     private static func quote(_ value: String) -> String { "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\"" }
