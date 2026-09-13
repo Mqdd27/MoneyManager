@@ -197,6 +197,37 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(try context.count(for: NSFetchRequest<FinancialTransaction>(entityName: "Transaction")), 0)
     }
 
+    func testInvestmentPositionUsesMovingAverageCostAndQuote() {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let account = account(context, currency: "USD")
+        let buy = transaction(context, account: account, amount: -100, kind: .investmentBuy); buy.investmentSymbol = "ABC"; buy.investmentQuantity = 10
+        let sell = transaction(context, account: account, amount: 60, kind: .investmentSell); sell.investmentSymbol = "ABC"; sell.investmentQuantity = 5
+        let quote = MarketQuote(context: context); quote.id = UUID(); quote.symbol = "ABC"; quote.currencyCode = "USD"; quote.price = 15; quote.updatedAt = Date(); quote.source = "Manual"
+        let position = FinancialCalculator.investmentPositions([buy, sell], quotes: [quote]).first!
+        XCTAssertEqual(position.quantity, 5); XCTAssertEqual(position.remainingCost, 50); XCTAssertEqual(position.averageCost, 10); XCTAssertEqual(position.realizedProfitLoss, 10); XCTAssertEqual(position.marketValue, 75); XCTAssertEqual(position.unrealizedProfitLoss, 25)
+    }
+
+    func testNetWorthSnapshotDoesNotChangeWithLaterQuotes() throws {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let result = NetWorthResult(cash: 10, investments: 20, unconvertibleCount: 0)
+        NetWorthSnapshotService.save(result, currencyCode: "USD", in: context)
+        let snapshots = try context.fetch(NSFetchRequest<NetWorthSnapshot>(entityName: "NetWorthSnapshot"))
+        XCTAssertEqual(snapshots.first?.totalValue.decimalValue, 30)
+        NetWorthSnapshotService.save(NetWorthResult(cash: 11, investments: 21, unconvertibleCount: 0), currencyCode: "USD", in: context)
+        XCTAssertEqual(try context.count(for: NSFetchRequest<NetWorthSnapshot>(entityName: "NetWorthSnapshot")), 1)
+        XCTAssertEqual(snapshots.first?.totalValue.decimalValue, 32)
+    }
+
+    func testNetWorthExcludesInvestmentCashMovement() {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let account = account(context, currency: "USD", openingBalance: 100)
+        let buy = transaction(context, account: account, amount: -100, kind: .investmentBuy); buy.investmentSymbol = "ABC"; buy.investmentQuantity = 10
+        let quote = MarketQuote(context: context); quote.id = UUID(); quote.symbol = "ABC"; quote.currencyCode = "USD"; quote.price = 12; quote.updatedAt = Date(); quote.source = "Manual"; quote.assetType = "Equity"; quote.isManual = true
+        let result = FinancialCalculator.netWorthResult(accounts: [account], transactions: [buy], quotes: [quote], currencyCode: "USD")
+        XCTAssertEqual(FinancialCalculator.balance(account: account, transactions: [buy]), 0)
+        XCTAssertEqual(result.cash, 100); XCTAssertEqual(result.investments, 120); XCTAssertEqual(result.total, 220)
+    }
+
     private func account(_ context: NSManagedObjectContext, currency: String, openingBalance: Decimal = 0) -> Account {
         let account = Account(context: context)
         account.id = UUID(); account.name = "Account"; account.kind = "Checking"; account.currencyCode = currency; account.openingBalance = NSDecimalNumber(decimal: openingBalance); account.createdAt = Date()
