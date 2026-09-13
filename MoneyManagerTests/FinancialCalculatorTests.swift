@@ -19,10 +19,66 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(rates.data.source, "Manual")
     }
 
-    func testCurrencyMigrationDefaultsInvalidCodeToIDR() {
+    func testCurrencyCatalogAndFormatterUseCurrencyFractionDigits() {
+        XCTAssertEqual(CurrencyFormatter.supportedCodes.prefix(4), ["IDR", "USD", "SGD", "CNY"])
+        XCTAssertEqual(CurrencyFormatter.definition(for: "IDR").fractionDigits, 0)
+        XCTAssertEqual(CurrencyFormatter.definition(for: "USD").fractionDigits, 2)
+        XCTAssertEqual(CurrencyFormatter.definition(for: "SGD").fractionDigits, 2)
+        XCTAssertEqual(CurrencyFormatter.definition(for: "CNY").fractionDigits, 2)
         XCTAssertEqual(CurrencyFormatter.normalizedCode(nil), "IDR")
-        XCTAssertEqual(CurrencyFormatter.normalizedCode("EUR"), "IDR")
+        XCTAssertEqual(CurrencyFormatter.normalizedCode("EUR"), "EUR")
         XCTAssertEqual(CurrencyFormatter.normalizedCode("invalid"), "IDR")
+    }
+
+    func testDecimalInputParserSupportsDotAndCommaWithoutFloatingPoint() {
+        XCTAssertEqual(DecimalInputParser.parse("1,234.56"), Decimal(string: "1234.56"))
+        XCTAssertEqual(DecimalInputParser.parse("1.234,56"), Decimal(string: "1234.56"))
+        XCTAssertEqual(DecimalInputParser.parse("0,10"), Decimal(string: "0.10"))
+        XCTAssertNil(DecimalInputParser.parse(""))
+    }
+
+    func testGenericExchangeRatePairsConvertBothDirectionsWithoutSeedRates() {
+        let defaults = UserDefaults(suiteName: "GenericRatePairs")!
+        defaults.removePersistentDomain(forName: "GenericRatePairs")
+        let rates = ExchangeRateService(defaults: defaults)
+        XCTAssertTrue(rates.pairs.isEmpty)
+        rates.setRate(from: "USD", to: "SGD", rate: Decimal(string: "1.35"), source: "Manual")
+        XCTAssertEqual(rates.convert(2, from: "USD", to: "SGD"), Decimal(string: "2.70"))
+        XCTAssertEqual(rates.convert(Decimal(string: "2.70")!, from: "SGD", to: "USD"), 2)
+    }
+
+    func testExchangeRatePairsUseIDRPivot() {
+        let defaults = UserDefaults(suiteName: "PivotRates")!
+        defaults.removePersistentDomain(forName: "PivotRates")
+        let rates = ExchangeRateService(defaults: defaults)
+        rates.setRate(from: "SGD", to: "IDR", rate: 12000)
+        rates.setRate(from: "CNY", to: "IDR", rate: 3000)
+        XCTAssertEqual(rates.convert(2, from: "SGD", to: "CNY"), 8)
+    }
+
+    func testMultiCurrencyNetWorthUsesIDRPivotRates() {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let accounts = [account(context, currency: "IDR", openingBalance: 1000), account(context, currency: "USD", openingBalance: 1), account(context, currency: "SGD", openingBalance: 1), account(context, currency: "CNY", openingBalance: 1)]
+        let defaults = UserDefaults(suiteName: "MultiCurrencyNetWorth")!
+        defaults.removePersistentDomain(forName: "MultiCurrencyNetWorth")
+        let rates = ExchangeRateService(defaults: defaults)
+        rates.setRate(from: "USD", to: "IDR", rate: 15000); rates.setRate(from: "SGD", to: "IDR", rate: 12000); rates.setRate(from: "CNY", to: "IDR", rate: 2200)
+        XCTAssertEqual(FinancialCalculator.netWorth(accounts: accounts, transactions: [], currencyCode: "IDR", rates: rates), 30200)
+    }
+
+    func testDecimalNSDecimalNumberRoundTripForSGDAndCNY() {
+        let value = Decimal(string: "8.64")!
+        XCTAssertEqual(NSDecimalNumber(decimal: value).decimalValue, value)
+        XCTAssertEqual(DecimalInputParser.parse("8,64"), value)
+    }
+
+    func testAccountEditKeepsIDAndTransactionsAndBlocksCurrencyChange() throws {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let account = account(context, currency: "SGD", openingBalance: 1), id = account.id
+        let record = transaction(context, account: account, amount: 8.64, kind: .income)
+        account.name = "Edited"; account.openingBalance = NSDecimalNumber(decimal: Decimal(string: "8.64")!); try context.save()
+        XCTAssertEqual(account.id, id); XCTAssertEqual(record.account, account)
+        XCTAssertFalse(AccountEditing.canChangeCurrency(account: account, transactions: [record]))
     }
 
     func testCashFlowConvertsAccountCurrencies() {
@@ -61,7 +117,7 @@ final class FinancialCalculatorTests: XCTestCase {
         let accountID = UUID(), categoryID = UUID()
         let backup = Backup(accounts: [BackupAccount(id: accountID, name: "Demo", kind: "Checking", currencyCode: "USD", openingBalance: 1, createdAt: Date(), isDemoData: true)], categories: [BackupCategory(id: categoryID, name: "Demo", kind: "expense", isDemoData: true)], transactions: [BackupTransaction(id: UUID(), date: Date(), amount: -1, note: nil, kind: "expense", transferID: nil, investmentSymbol: nil, investmentQuantity: nil, accountID: accountID, categoryID: categoryID, isDemoData: true)], settings: settings, rateData: rate)
         let decoded = try JSONDecoder().decode(Backup.self, from: JSONEncoder().encode(backup))
-        XCTAssertEqual(decoded.version, 2)
+        XCTAssertEqual(decoded.version, 3)
         XCTAssertEqual(decoded.settings, settings)
         XCTAssertEqual(decoded.rateData, rate)
         XCTAssertTrue(decoded.accounts[0].isDemoData)
