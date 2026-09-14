@@ -276,6 +276,79 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(result.total, 6600000)
     }
 
+    func testFrankfurterResponseDecodesToDecimal() throws {
+        let integer = try JSONDecoder().decode(FrankfurterRate.self, from: Data("{\"date\":\"2026-09-14\",\"base\":\"USD\",\"quote\":\"IDR\",\"rate\":17627}".utf8))
+        XCTAssertEqual(integer.rate, Decimal(17627))
+        XCTAssertEqual(integer.base, "USD"); XCTAssertEqual(integer.quote, "IDR")
+        let fractional = try JSONDecoder().decode(FrankfurterRate.self, from: Data("{\"date\":\"2026-09-14\",\"base\":\"CNY\",\"quote\":\"IDR\",\"rate\":2628.35}".utf8))
+        XCTAssertEqual(fractional.rate, Decimal(string: "2628.35"))
+    }
+
+    func testAutomaticRefreshStoresFrankfurterPairs() {
+        let mock = MockRateProvider(responses: ["USD/IDR": frankfurterRate(base: "USD", quote: "IDR", rate: 17627)])
+        let defaults = UserDefaults(suiteName: "AutoRefresh")!
+        defaults.removePersistentDomain(forName: "AutoRefresh")
+        let rates = ExchangeRateService(defaults: defaults, provider: mock)
+        let expectation = XCTestExpectation(description: "refresh")
+        rates.refreshRatesIfNeeded(nativeCurrencies: ["USD"]) { updated in
+            XCTAssertTrue(updated)
+            XCTAssertEqual(rates.convert(2, from: "USD", to: "IDR"), 35254)
+            XCTAssertEqual(rates.pairs.first?.source, "Frankfurter")
+            expectation.fulfill()
+        }
+        wait(for: [expectation], timeout: 5)
+    }
+
+    func testStaleRatesRefreshWhileFreshOnesAreSkipped() {
+        let mock = MockRateProvider(responses: ["SGD/IDR": frankfurterRate(base: "SGD", quote: "IDR", rate: 13902)])
+        let defaults = UserDefaults(suiteName: "StaleRefresh")!
+        defaults.removePersistentDomain(forName: "StaleRefresh")
+        let rates = ExchangeRateService(defaults: defaults, provider: mock)
+        rates.setRate(from: "USD", to: "IDR", rate: 17627, source: "Frankfurter", updatedAt: Date())
+        rates.setRate(from: "SGD", to: "IDR", rate: 12000, source: "Frankfurter", updatedAt: Date(timeIntervalSinceNow: -100000))
+        let expectation = XCTestExpectation(description: "refresh")
+        rates.refreshRatesIfNeeded(nativeCurrencies: ["USD", "SGD"]) { _ in expectation.fulfill() }
+        wait(for: [expectation], timeout: 5)
+        XCTAssertEqual(mock.requested, ["SGD/IDR"])
+        XCTAssertEqual(rates.convert(1, from: "SGD", to: "IDR"), 13902)
+    }
+
+    func testManualOverrideIsNeverAutoRefreshed() {
+        let mock = MockRateProvider(responses: ["USD/IDR": frankfurterRate(base: "USD", quote: "IDR", rate: 17627)])
+        let defaults = UserDefaults(suiteName: "ManualOverride")!
+        defaults.removePersistentDomain(forName: "ManualOverride")
+        let rates = ExchangeRateService(defaults: defaults, provider: mock)
+        rates.setManualOverride(from: "USD", to: "IDR", rate: 15000)
+        let expectation = XCTestExpectation(description: "refresh")
+        rates.refreshRatesIfNeeded(nativeCurrencies: ["USD"], force: true) { _ in expectation.fulfill() }
+        wait(for: [expectation], timeout: 5)
+        XCTAssertTrue(mock.requested.isEmpty)
+        XCTAssertEqual(rates.convert(1, from: "USD", to: "IDR"), 15000)
+        rates.clearManualOverride(from: "USD", to: "IDR")
+        XCTAssertNil(rates.convert(1, from: "USD", to: "IDR"))
+    }
+
+    func testOfflineFailureFallsBackToCachedRate() {
+        let mock = MockRateProvider(responses: [:])
+        let defaults = UserDefaults(suiteName: "OfflineFallback")!
+        defaults.removePersistentDomain(forName: "OfflineFallback")
+        let rates = ExchangeRateService(defaults: defaults, provider: mock)
+        rates.setRate(from: "USD", to: "IDR", rate: 17627, source: "Frankfurter", updatedAt: Date(timeIntervalSinceNow: -100000))
+        let expectation = XCTestExpectation(description: "refresh")
+        rates.refreshRatesIfNeeded(nativeCurrencies: ["USD"], force: true) { _ in expectation.fulfill() }
+        wait(for: [expectation], timeout: 5)
+        XCTAssertEqual(rates.convert(1, from: "USD", to: "IDR"), 17627)
+    }
+
+    func testCrossConversionSGDToUSDThroughIDR() {
+        let defaults = UserDefaults(suiteName: "CrossConvert")!
+        defaults.removePersistentDomain(forName: "CrossConvert")
+        let rates = ExchangeRateService(defaults: defaults)
+        rates.setRate(from: "USD", to: "IDR", rate: 16000, source: "Frankfurter")
+        rates.setRate(from: "SGD", to: "IDR", rate: 12000, source: "Frankfurter")
+        XCTAssertEqual(rates.convert(2, from: "SGD", to: "USD"), Decimal(string: "1.5"))
+    }
+
     private func account(_ context: NSManagedObjectContext, currency: String, openingBalance: Decimal = 0) -> Account {
         let account = Account(context: context)
         account.id = UUID(); account.name = "Account"; account.kind = "Checking"; account.currencyCode = currency; account.openingBalance = NSDecimalNumber(decimal: openingBalance); account.createdAt = Date()
@@ -293,4 +366,20 @@ final class FinancialCalculatorTests: XCTestCase {
         transaction.id = UUID(); transaction.account = account; transaction.date = Date(); transaction.amount = NSDecimalNumber(decimal: amount); transaction.kind = kind.rawValue
         return transaction
     }
+}
+
+final class MockRateProvider: ExchangeRateProvider {
+    var responses: [String: FrankfurterRate]
+    private(set) var requested: [String] = []
+    init(responses: [String: FrankfurterRate]) { self.responses = responses }
+    func fetchRate(from: String, to: String, completion: @escaping (Result<FrankfurterRate, Error>) -> Void) {
+        let key = "\(from.uppercased())/\(to.uppercased())"
+        requested.append(key)
+        if let rate = responses[key] { completion(.success(rate)) }
+        else { completion(.failure(URLError(.badServerResponse))) }
+    }
+}
+
+func frankfurterRate(base: String, quote: String, rate: Decimal) -> FrankfurterRate {
+    FrankfurterRate(date: "2026-09-14", base: base, quote: quote, rate: rate)
 }
