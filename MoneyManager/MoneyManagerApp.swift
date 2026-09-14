@@ -592,17 +592,25 @@ struct AccountDetailView: View {
     @FetchRequest(entity: FinancialTransaction.entity(), sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
     @State private var editing = false
     @State private var confirmingDelete = false
+    @State private var isDeleted = false
     var body: some View {
-        List {
-            Section("Account") { ValueRow(title: "Balance", value: FinancialCalculator.balance(account: account, transactions: Array(transactions)), currencyCode: account.currencyCode); Text(account.kind); if !account.institution.isEmpty { Text(account.institution) }; if !account.notes.isEmpty { Text(account.notes) } }
-            Section("Transactions") { ForEach(transactions.filter { $0.account == account }) { TransactionRow(transaction: $0) } }
-            Section { Button("Delete Account", role: .destructive) { confirmingDelete = true } }
-        }.navigationTitle(account.name).toolbar { Button("Edit") { editing = true } }.sheet(isPresented: $editing) { NavigationView { AccountEditor(account: account) } }
+        Group {
+            if isDeleted {
+                Text("This account was deleted.").foregroundColor(.secondary)
+            } else {
+                List {
+                    Section("Account") { ValueRow(title: "Balance", value: FinancialCalculator.balance(account: account, transactions: Array(transactions)), currencyCode: account.currencyCode); Text(account.kind); if !account.institution.isEmpty { Text(account.institution) }; if !account.notes.isEmpty { Text(account.notes) } }
+                    Section("Transactions") { ForEach(transactions.filter { $0.account == account }) { TransactionRow(transaction: $0) } }
+                    Section { Button("Delete Account", role: .destructive) { confirmingDelete = true } }
+                }
+            }
+        }.navigationTitle(isDeleted ? "" : account.name).toolbar { Button("Edit") { editing = true } }.sheet(isPresented: $editing) { NavigationView { AccountEditor(account: account) } }
         .alert("Delete Account?", isPresented: $confirmingDelete) {
             Button("Delete", role: .destructive) {
+                isDeleted = true
                 let objectID = account.objectID
-                dismiss()
                 DispatchQueue.main.async {
+                    dismiss()
                     guard let object = try? context.existingObject(with: objectID) as? Account else { return }
                     let all = (try? context.fetch(NSFetchRequest<FinancialTransaction>(entityName: "Transaction"))) ?? []
                     try? AccountDeletion.delete(object, transactions: all, in: context)
