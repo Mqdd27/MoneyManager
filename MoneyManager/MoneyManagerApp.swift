@@ -165,27 +165,109 @@ struct DecimalInputParser {
 }
 
 struct ExchangeRateData: Codable, Equatable { var usdIDR: Decimal; var source: String; var lastUpdated: Date }
-struct ExchangeRatePair: Codable, Equatable, Identifiable { var from: String; var to: String; var rate: Decimal; var source: String; var updatedAt: Date; var id: String { "\(from)/\(to)" } }
+struct ExchangeRatePair: Codable, Equatable, Identifiable {
+    var from: String; var to: String; var rate: Decimal; var source: String; var updatedAt: Date; var isManualOverride: Bool; var providerDate: String?
+    var id: String { "\(from)/\(to)" }
+    init(from: String, to: String, rate: Decimal, source: String, updatedAt: Date, isManualOverride: Bool = false, providerDate: String? = nil) {
+        self.from = from; self.to = to; self.rate = rate; self.source = source; self.updatedAt = updatedAt; self.isManualOverride = isManualOverride; self.providerDate = providerDate
+    }
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        from = try container.decode(String.self, forKey: .from); to = try container.decode(String.self, forKey: .to)
+        rate = try container.decode(Decimal.self, forKey: .rate); source = try container.decode(String.self, forKey: .source)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        isManualOverride = try container.decodeIfPresent(Bool.self, forKey: .isManualOverride) ?? (source == "Manual" || source == "Manual Override")
+        providerDate = try container.decodeIfPresent(String.self, forKey: .providerDate)
+    }
+}
+
+struct FrankfurterRate: Codable, Equatable { var date: String; var base: String; var quote: String; var rate: Decimal }
+
+protocol ExchangeRateProvider {
+    func fetchRate(from: String, to: String, completion: @escaping (Result<FrankfurterRate, Error>) -> Void)
+}
+
+struct FrankfurterProvider: ExchangeRateProvider {
+    func fetchRate(from: String, to: String, completion: @escaping (Result<FrankfurterRate, Error>) -> Void) {
+        guard let url = URL(string: "https://api.frankfurter.dev/v2/rate/\(from.lowercased())/\(to.lowercased())") else {
+            completion(.failure(URLError(.badURL))); return
+        }
+        URLSession.shared.dataTask(with: url) { data, response, error in
+            if let error = error { completion(.failure(error)); return }
+            guard let data = data, let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                completion(.failure(URLError(.badServerResponse))); return
+            }
+            do { completion(.success(try JSONDecoder().decode(FrankfurterRate.self, from: data))) }
+            catch { completion(.failure(error)) }
+        }.resume()
+    }
+}
 
 final class ExchangeRateService: ObservableObject {
     static let shared = ExchangeRateService()
+    static let freshnessInterval: TimeInterval = 24 * 3600
     @Published private(set) var pairs: [ExchangeRatePair]
+    @Published private(set) var isRefreshing = false
+    var provider: ExchangeRateProvider = FrankfurterProvider()
     private let key = "exchangeRatePairsV3", defaults: UserDefaults
-    init(defaults: UserDefaults = .standard) {
-        self.defaults = defaults
+    init(defaults: UserDefaults = .standard, provider: ExchangeRateProvider = FrankfurterProvider()) {
+        self.defaults = defaults; self.provider = provider
         if let saved = defaults.data(forKey: key), let decoded = try? JSONDecoder().decode([ExchangeRatePair].self, from: saved) { pairs = decoded }
         else if let saved = defaults.data(forKey: "usdIDRRateV2"), let legacy = try? JSONDecoder().decode(ExchangeRateData.self, from: saved), legacy.usdIDR > 0 { pairs = [ExchangeRatePair(from: "USD", to: "IDR", rate: legacy.usdIDR, source: legacy.source, updatedAt: legacy.lastUpdated)] }
         else { pairs = [] }
     }
     var data: ExchangeRateData { let pair = pairs.first { $0.from == "USD" && $0.to == "IDR" }; return ExchangeRateData(usdIDR: pair?.rate ?? 0, source: pair?.source ?? "Manual", lastUpdated: pair?.updatedAt ?? Date()) }
     var usdIDRRate: Decimal { data.usdIDR }
-    func setRate(from: String, to: String, rate: Decimal?, source: String = "Manual", updatedAt: Date = Date()) {
+    var lastAutomaticUpdate: Date? { pairs.filter { !$0.isManualOverride }.map(\.updatedAt).max() }
+    var statusSummary: String {
+        guard let last = lastAutomaticUpdate else { return pairs.isEmpty ? "No rates" : "Manual only" }
+        return Date().timeIntervalSince(last) < Self.freshnessInterval ? "Up to date" : "Stale"
+    }
+    func isFresh(_ pair: ExchangeRatePair, now: Date = Date()) -> Bool {
+        !pair.isManualOverride && now.timeIntervalSince(pair.updatedAt) < Self.freshnessInterval
+    }
+    func setRate(from: String, to: String, rate: Decimal?, source: String = "Manual", updatedAt: Date = Date(), providerDate: String? = nil, manual: Bool = false) {
         let from = CurrencyFormatter.normalizedCode(from), to = CurrencyFormatter.normalizedCode(to)
         pairs.removeAll { $0.from == from && $0.to == to }
-        if let rate = rate, rate > 0, from != to { pairs.append(ExchangeRatePair(from: from, to: to, rate: rate, source: source, updatedAt: updatedAt)) }
+        if let rate = rate, rate > 0, from != to { pairs.append(ExchangeRatePair(from: from, to: to, rate: rate, source: source, updatedAt: updatedAt, isManualOverride: manual, providerDate: providerDate)) }
         defaults.set(try? JSONEncoder().encode(pairs), forKey: key)
     }
     func setUSDIDRRate(_ rate: Decimal?, source: String = "Manual", lastUpdated: Date = Date()) { setRate(from: "USD", to: "IDR", rate: rate, source: source, updatedAt: lastUpdated) }
+    func setManualOverride(from: String, to: String, rate: Decimal?) {
+        if rate == nil { clearManualOverride(from: from, to: to); return }
+        setRate(from: from, to: to, rate: rate, source: "Manual Override", manual: true)
+    }
+    func clearManualOverride(from: String, to: String) {
+        let from = CurrencyFormatter.normalizedCode(from), to = CurrencyFormatter.normalizedCode(to)
+        pairs.removeAll { $0.from == from && $0.to == to }
+        defaults.set(try? JSONEncoder().encode(pairs), forKey: key)
+    }
+    func refreshRatesIfNeeded(nativeCurrencies: Set<String>, force: Bool = false, completion: ((Bool) -> Void)? = nil) {
+        let now = Date()
+        let missing = nativeCurrencies.map { CurrencyFormatter.normalizedCode($0) }.filter { $0 != "IDR" }.filter { code in
+            force || pairs.first(where: { $0.from == code && $0.to == "IDR" }).map { !isFresh($0, now: now) } ?? true
+        }
+        guard !missing.isEmpty else { completion?(false); return }
+        isRefreshing = true
+        let group = DispatchGroup()
+        var updated = false
+        for code in missing {
+            group.enter()
+            provider.fetchRate(from: code, to: "IDR") { [weak self] result in
+                if let self = self, case .success(let quote) = result, quote.rate > 0 {
+                    self.setRate(from: quote.base, to: quote.quote, rate: quote.rate, source: "Frankfurter", updatedAt: now, providerDate: quote.date)
+                    updated = true
+                }
+                group.leave()
+            }
+        }
+        group.notify(queue: .main) { [weak self] in self?.isRefreshing = false; completion?(updated) }
+    }
+    func refreshRates(nativeCurrencies: Set<String>, force: Bool = false) async -> Bool {
+        await withCheckedContinuation { continuation in
+            refreshRatesIfNeeded(nativeCurrencies: nativeCurrencies, force: force) { updated in continuation.resume(returning: updated) }
+        }
+    }
     func convert(_ amount: Decimal, from: String, to: String) -> Decimal? {
         let from = CurrencyFormatter.normalizedCode(from), to = CurrencyFormatter.normalizedCode(to)
         if from == to { return amount }
@@ -419,6 +501,9 @@ struct DashboardView: View {
     private var reportingCurrency: String { CurrencyFormatter.normalizedCode(baseCurrency) }
     private var secondaryReportingCurrency: String? { secondaryCurrency.isEmpty ? nil : CurrencyFormatter.normalizedCode(secondaryCurrency) }
     private var cashFlow: (income: Decimal, expense: Decimal) { FinancialCalculator.cashFlow(Array(transactions), currencyCode: reportingCurrency) }
+    private var nativeCurrencies: Set<String> {
+        Set(accounts.map { $0.currencyCode } + quotes.map { $0.currencyCode })
+    }
 
     var body: some View {
         NavigationView {
@@ -433,7 +518,8 @@ struct DashboardView: View {
                     Text(CurrencyFormatter.string(result.total, code: reportingCurrency)).font(.title2).fontWeight(.semibold)
                     ValueRow(title: "Cash", value: result.cash, currencyCode: reportingCurrency)
                     ValueRow(title: "Investments", value: result.investments, currencyCode: reportingCurrency)
-                    if result.unconvertibleCount > 0 { Text("\(result.unconvertibleCount) value(s) excluded because no conversion or quote is available.").foregroundColor(.orange) }
+                    if result.unconvertibleCount > 0 { Text("Net Worth is incomplete because some exchange rates are unavailable.").foregroundColor(.orange) }
+                    else if ExchangeRateService.shared.statusSummary == "Stale", let last = ExchangeRateService.shared.lastAutomaticUpdate { Text("Using exchange rates from \(last.formatted(date: .abbreviated, time: .omitted)).").font(.caption).foregroundColor(.secondary) }
                     Button("Save Today’s Snapshot") { NetWorthSnapshotService.save(result, currencyCode: reportingCurrency, in: context) }
                     if let secondary = secondaryReportingCurrency, let converted = ExchangeRateService.shared.convert(result.total, from: reportingCurrency, to: secondary) { Text("Approx. " + CurrencyFormatter.string(converted, code: secondary)).foregroundColor(.secondary) }
                 }
@@ -446,6 +532,8 @@ struct DashboardView: View {
                 }
             }
             .navigationTitle("Dashboard")
+            .refreshable { await ExchangeRateService.shared.refreshRates(nativeCurrencies: nativeCurrencies) }
+            .onAppear { ExchangeRateService.shared.refreshRatesIfNeeded(nativeCurrencies: nativeCurrencies) }
         }
     }
 }
@@ -651,12 +739,29 @@ struct SettingsView: View {
                     Text("None").tag("")
                     ForEach(CurrencyFormatter.supportedCodes.filter { $0 != CurrencyFormatter.normalizedCode(baseCurrency) }, id: \.self) { Text($0) }
                 }
+            }
+            Section("Exchange Rates") {
+                HStack { Text("Source"); Spacer(); Text("Frankfurter") }
+                if let last = exchangeRates.lastAutomaticUpdate { HStack { Text("Last Updated"); Spacer(); Text(last.formatted(date: .abbreviated, time: .shortened)) } }
+                HStack { Text("Status"); Spacer(); Text(exchangeRates.statusSummary) }
+                Button(exchangeRates.isRefreshing ? "Refreshing..." : "Refresh Rates") {
+                    exchangeRates.refreshRatesIfNeeded(nativeCurrencies: Set(accounts.map { $0.currencyCode } + quotes.map { $0.currencyCode }), force: true)
+                }.disabled(exchangeRates.isRefreshing)
                 ForEach(neededCurrencies, id: \.self) { code in
                     let pair = exchangeRates.pairs.first(where: { $0.from == code && $0.to == "IDR" })
-                    TextField("\(code)/IDR Rate", value: Binding(get: { pair?.rate }, set: { exchangeRates.setRate(from: code, to: "IDR", rate: $0) }), format: .number)
-                        .keyboardType(.decimalPad)
-                    Text("Source: \(pair?.source ?? "Manual")")
-                    Text("Updated: \(pair?.updatedAt.formatted(date: .abbreviated, time: .shortened) ?? "Never")")
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("1 \(code) = \(pair.map { NSDecimalNumber(decimal: $0.rate).stringValue } ?? "—") IDR")
+                            Spacer()
+                            Text(pair?.source ?? "None").foregroundColor(.secondary)
+                        }
+                        if pair?.isManualOverride == true {
+                            Button("Use Automatic") { exchangeRates.clearManualOverride(from: code, to: "IDR") }
+                        } else {
+                            TextField("Manual override", value: Binding(get: { pair?.rate }, set: { exchangeRates.setManualOverride(from: code, to: "IDR", rate: $0) }), format: .number)
+                                .keyboardType(.decimalPad)
+                        }
+                    }
                 }
             }
             Section("Categories") { Button("Manage Categories") { showingCategories = true } }
