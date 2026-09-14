@@ -566,7 +566,7 @@ struct AccountsView: View {
                     ValueRow(title: account.name, value: FinancialCalculator.balance(account: account, transactions: Array(transactions)), currencyCode: account.currencyCode)
                 }
             }
-                .onDelete { indexes in indexes.map { accounts[$0] }.forEach { account in transactions.filter { $0.account == account }.forEach(context.delete); context.delete(account) }; try? context.save() }
+                .onDelete { indexes in indexes.map { accounts[$0] }.forEach { account in try? AccountDeletion.delete(account, transactions: Array(transactions), in: context) } }
         }.navigationTitle("Accounts").toolbar { Button(action: { showingAdd = true }) { Label("Add Account", systemImage: "plus") } }.sheet(isPresented: $showingAdd) { NavigationView { AccountEditor() } } }
     }
 }
@@ -575,15 +575,33 @@ enum AccountEditing {
     static func canChangeCurrency(account: Account, transactions: [FinancialTransaction]) -> Bool { !transactions.contains { $0.account == account } }
 }
 
+enum AccountDeletion {
+    static func delete(_ account: Account, transactions: [FinancialTransaction], in context: NSManagedObjectContext) throws {
+        let own = transactions.filter { $0.account == account }
+        let counterpartIDs = Set(own.compactMap(\.transferID))
+        (own + transactions.filter { $0.transferID.map { counterpartIDs.contains($0) } ?? false }).forEach(context.delete)
+        context.delete(account)
+        try context.save()
+    }
+}
+
 struct AccountDetailView: View {
     let account: Account
+    @Environment(\.managedObjectContext) private var context
+    @Environment(\.dismiss) private var dismiss
     @FetchRequest(entity: FinancialTransaction.entity(), sortDescriptors: [NSSortDescriptor(keyPath: \FinancialTransaction.date, ascending: false)]) private var transactions: FetchedResults<FinancialTransaction>
     @State private var editing = false
+    @State private var confirmingDelete = false
     var body: some View {
         List {
             Section("Account") { ValueRow(title: "Balance", value: FinancialCalculator.balance(account: account, transactions: Array(transactions)), currencyCode: account.currencyCode); Text(account.kind); if !account.institution.isEmpty { Text(account.institution) }; if !account.notes.isEmpty { Text(account.notes) } }
             Section("Transactions") { ForEach(transactions.filter { $0.account == account }) { TransactionRow(transaction: $0) } }
+            Section { Button("Delete Account", role: .destructive) { confirmingDelete = true } }
         }.navigationTitle(account.name).toolbar { Button("Edit") { editing = true } }.sheet(isPresented: $editing) { NavigationView { AccountEditor(account: account) } }
+        .alert("Delete Account?", isPresented: $confirmingDelete) {
+            Button("Delete", role: .destructive) { try? AccountDeletion.delete(account, transactions: Array(transactions), in: context); dismiss() }
+            Button("Cancel", role: .cancel) {}
+        } message: { Text("This permanently deletes this account and its transactions. Transfer counterparts in other accounts are removed as well.") }
     }
 }
 

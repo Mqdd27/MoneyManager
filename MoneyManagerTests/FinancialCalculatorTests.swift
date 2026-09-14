@@ -365,6 +365,25 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(rates.convert(2, from: "SGD", to: "USD"), Decimal(string: "1.5"))
     }
 
+    func testDeletingAccountRemovesTransactionsAndTransferCounterparts() throws {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let first = account(context, currency: "IDR", openingBalance: 1000)
+        let second = account(context, currency: "IDR", openingBalance: 500)
+        let transferID = UUID()
+        let outgoing = transaction(context, account: first, amount: -100, kind: .transfer)
+        outgoing.transferID = transferID
+        let incoming = transaction(context, account: second, amount: 100, kind: .transfer)
+        incoming.transferID = transferID
+        let ordinary = transaction(context, account: second, amount: 25, kind: .income)
+        try context.save()
+
+        try AccountDeletion.delete(first, transactions: [outgoing, incoming, ordinary], in: context)
+        let accounts = try context.fetch(NSFetchRequest<Account>(entityName: "Account"))
+        let transactions = try context.fetch(NSFetchRequest<FinancialTransaction>(entityName: "Transaction"))
+        XCTAssertEqual(accounts.map(\.id), [second.id])
+        XCTAssertEqual(transactions.map(\.id), [ordinary.id])
+    }
+
     private func account(_ context: NSManagedObjectContext, currency: String, openingBalance: Decimal = 0) -> Account {
         let account = Account(context: context)
         account.id = UUID(); account.name = "Account"; account.kind = "Checking"; account.currencyCode = currency; account.openingBalance = NSDecimalNumber(decimal: openingBalance); account.createdAt = Date()
