@@ -228,6 +228,54 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(result.cash, 100); XCTAssertEqual(result.investments, 120); XCTAssertEqual(result.total, 220)
     }
 
+    func testMultiCurrencyReportingAndPersistence() {
+        let defaults = UserDefaults(suiteName: "ReportingPersistence")!
+        defaults.removePersistentDomain(forName: "ReportingPersistence")
+        let settings = ReportingSettings(baseCurrency: "SGD", secondaryCurrency: "IDR")
+        settings.save(defaults: defaults)
+        let loaded = ReportingSettings.current(defaults: defaults)
+        XCTAssertEqual(loaded.baseCurrency, "SGD")
+        XCTAssertEqual(loaded.secondaryCurrency, "IDR")
+
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let idrAcc = account(context, currency: "IDR", openingBalance: 5000000)
+        let usdAcc = account(context, currency: "USD", openingBalance: 100)
+        let sgdAcc = account(context, currency: "SGD", openingBalance: 50)
+
+        let rates = ExchangeRateService(defaults: defaults)
+        rates.setRate(from: "USD", to: "IDR", rate: 16000)
+        rates.setRate(from: "SGD", to: "IDR", rate: 12000)
+
+        let idrResult = FinancialCalculator.netWorthResult(accounts: [idrAcc, usdAcc, sgdAcc], transactions: [], quotes: [], currencyCode: "IDR", rates: rates)
+        XCTAssertEqual(idrResult.total, 7200000)
+
+        let usdResult = FinancialCalculator.netWorthResult(accounts: [idrAcc, usdAcc, sgdAcc], transactions: [], quotes: [], currencyCode: "USD", rates: rates)
+        XCTAssertEqual(usdResult.total, 450)
+
+        let sgdResult = FinancialCalculator.netWorthResult(accounts: [idrAcc, usdAcc, sgdAcc], transactions: [], quotes: [], currencyCode: "SGD", rates: rates)
+        XCTAssertEqual(sgdResult.total, 600)
+
+        XCTAssertEqual(idrAcc.openingBalance, 5000000)
+        XCTAssertEqual(usdAcc.openingBalance, 100)
+        XCTAssertEqual(sgdAcc.openingBalance, 50)
+    }
+
+    func testMissingSGDRateExcludesUnconvertibleAccount() {
+        let defaults = UserDefaults(suiteName: "MissingRateTest")!
+        defaults.removePersistentDomain(forName: "MissingRateTest")
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let idrAcc = account(context, currency: "IDR", openingBalance: 5000000)
+        let usdAcc = account(context, currency: "USD", openingBalance: 100)
+        let sgdAcc = account(context, currency: "SGD", openingBalance: 50)
+
+        let rates = ExchangeRateService(defaults: defaults)
+        rates.setRate(from: "USD", to: "IDR", rate: 16000)
+
+        let result = FinancialCalculator.netWorthResult(accounts: [idrAcc, usdAcc, sgdAcc], transactions: [], quotes: [], currencyCode: "IDR", rates: rates)
+        XCTAssertGreaterThan(result.unconvertibleCount, 0)
+        XCTAssertEqual(result.total, 6600000)
+    }
+
     private func account(_ context: NSManagedObjectContext, currency: String, openingBalance: Decimal = 0) -> Account {
         let account = Account(context: context)
         account.id = UUID(); account.name = "Account"; account.kind = "Checking"; account.currencyCode = currency; account.openingBalance = NSDecimalNumber(decimal: openingBalance); account.createdAt = Date()
