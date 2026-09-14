@@ -453,7 +453,9 @@ final class AppLock: ObservableObject {
 
 struct RootView: View {
     @AppStorage("appLockEnabled") private var lockEnabled = false
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var lock = AppLock()
+    @State private var lockedInBackground = false
 
     var body: some View {
         Group {
@@ -465,6 +467,11 @@ struct RootView: View {
             else { lock.isUnlocked = false; lock.unlock() }
         }
         .onAppear { if lockEnabled { lock.unlock() } else { lock.isUnlocked = true } }
+        .onChange(of: scenePhase) { phase in
+            guard lockEnabled else { return }
+            if phase == .background { lock.isUnlocked = false; lockedInBackground = true }
+            else if phase == .active, lockedInBackground { lockedInBackground = false; lock.unlock() }
+        }
     }
 }
 
