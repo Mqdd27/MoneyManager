@@ -242,9 +242,10 @@ final class ExchangeRateService: ObservableObject {
         pairs.removeAll { $0.from == from && $0.to == to }
         defaults.set(try? JSONEncoder().encode(pairs), forKey: key)
     }
-    func refreshRatesIfNeeded(nativeCurrencies: Set<String>, force: Bool = false, completion: ((Bool) -> Void)? = nil) {
+    func refreshRatesIfNeeded(nativeCurrencies: Set<String>, reportingCurrency: String = "IDR", force: Bool = false, completion: ((Bool) -> Void)? = nil) {
         let now = Date()
-        let missing = nativeCurrencies.map { CurrencyFormatter.normalizedCode($0) }.filter { $0 != "IDR" }.filter { code in
+        let needed = Set(nativeCurrencies.map { CurrencyFormatter.normalizedCode($0) } + [CurrencyFormatter.normalizedCode(reportingCurrency)])
+        let missing = needed.filter { $0 != "IDR" }.filter { code in
             force || pairs.first(where: { $0.from == code && $0.to == "IDR" }).map { !isFresh($0, now: now) } ?? true
         }
         guard !missing.isEmpty else { completion?(false); return }
@@ -263,9 +264,9 @@ final class ExchangeRateService: ObservableObject {
         }
         group.notify(queue: .main) { [weak self] in self?.isRefreshing = false; completion?(updated) }
     }
-    func refreshRates(nativeCurrencies: Set<String>, force: Bool = false) async -> Bool {
+    func refreshRates(nativeCurrencies: Set<String>, reportingCurrency: String = "IDR", force: Bool = false) async -> Bool {
         await withCheckedContinuation { continuation in
-            refreshRatesIfNeeded(nativeCurrencies: nativeCurrencies, force: force) { updated in continuation.resume(returning: updated) }
+            refreshRatesIfNeeded(nativeCurrencies: nativeCurrencies, reportingCurrency: reportingCurrency, force: force) { updated in continuation.resume(returning: updated) }
         }
     }
     func convert(_ amount: Decimal, from: String, to: String) -> Decimal? {
@@ -532,8 +533,8 @@ struct DashboardView: View {
                 }
             }
             .navigationTitle("Dashboard")
-            .refreshable { await ExchangeRateService.shared.refreshRates(nativeCurrencies: nativeCurrencies) }
-            .onAppear { ExchangeRateService.shared.refreshRatesIfNeeded(nativeCurrencies: nativeCurrencies) }
+            .refreshable { await ExchangeRateService.shared.refreshRates(nativeCurrencies: nativeCurrencies, reportingCurrency: reportingCurrency) }
+            .onAppear { ExchangeRateService.shared.refreshRatesIfNeeded(nativeCurrencies: nativeCurrencies, reportingCurrency: reportingCurrency) }
         }
     }
 }
@@ -745,7 +746,7 @@ struct SettingsView: View {
                 if let last = exchangeRates.lastAutomaticUpdate { HStack { Text("Last Updated"); Spacer(); Text(last.formatted(date: .abbreviated, time: .shortened)) } }
                 HStack { Text("Status"); Spacer(); Text(exchangeRates.statusSummary) }
                 Button(exchangeRates.isRefreshing ? "Refreshing..." : "Refresh Rates") {
-                    exchangeRates.refreshRatesIfNeeded(nativeCurrencies: Set(accounts.map { $0.currencyCode } + quotes.map { $0.currencyCode }), force: true)
+                    exchangeRates.refreshRatesIfNeeded(nativeCurrencies: Set(accounts.map { $0.currencyCode } + quotes.map { $0.currencyCode }), reportingCurrency: baseCurrency, force: true)
                 }.disabled(exchangeRates.isRefreshing)
                 ForEach(neededCurrencies, id: \.self) { code in
                     let pair = exchangeRates.pairs.first(where: { $0.from == code && $0.to == "IDR" })

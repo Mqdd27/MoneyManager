@@ -340,6 +340,22 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(rates.convert(1, from: "USD", to: "IDR"), 17627)
     }
 
+    func testRefreshFetchesReportingCurrencyPairForNonNativeReporting() {
+        let mock = MockRateProvider(responses: [
+            "EUR/IDR": frankfurterRate(base: "EUR", quote: "IDR", rate: 17000),
+            "USD/IDR": frankfurterRate(base: "USD", quote: "IDR", rate: 16000)
+        ])
+        let defaults = UserDefaults(suiteName: "ReportingPairFetch")!
+        defaults.removePersistentDomain(forName: "ReportingPairFetch")
+        let rates = ExchangeRateService(defaults: defaults, provider: mock)
+        let expectation = XCTestExpectation(description: "refresh")
+        rates.refreshRatesIfNeeded(nativeCurrencies: ["IDR", "EUR"], reportingCurrency: "USD") { _ in expectation.fulfill() }
+        wait(for: [expectation], timeout: 5)
+        XCTAssertTrue(mock.requested.contains("EUR/IDR"))
+        XCTAssertTrue(mock.requested.contains("USD/IDR"))
+        XCTAssertEqual(rates.convert(2, from: "EUR", to: "USD"), Decimal(string: "2.125"))
+    }
+
     func testCrossConversionSGDToUSDThroughIDR() {
         let defaults = UserDefaults(suiteName: "CrossConvert")!
         defaults.removePersistentDomain(forName: "CrossConvert")
