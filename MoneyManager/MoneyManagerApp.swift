@@ -599,7 +599,15 @@ struct AccountDetailView: View {
             Section { Button("Delete Account", role: .destructive) { confirmingDelete = true } }
         }.navigationTitle(account.name).toolbar { Button("Edit") { editing = true } }.sheet(isPresented: $editing) { NavigationView { AccountEditor(account: account) } }
         .alert("Delete Account?", isPresented: $confirmingDelete) {
-            Button("Delete", role: .destructive) { try? AccountDeletion.delete(account, transactions: Array(transactions), in: context); dismiss() }
+            Button("Delete", role: .destructive) {
+                let objectID = account.objectID
+                dismiss()
+                DispatchQueue.main.async {
+                    guard let object = try? context.existingObject(with: objectID) as? Account else { return }
+                    let all = (try? context.fetch(NSFetchRequest<FinancialTransaction>(entityName: "Transaction"))) ?? []
+                    try? AccountDeletion.delete(object, transactions: all, in: context)
+                }
+            }
             Button("Cancel", role: .cancel) {}
         } message: { Text("This permanently deletes this account and its transactions. Transfer counterparts in other accounts are removed as well.") }
     }
