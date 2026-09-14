@@ -355,9 +355,18 @@ struct FinancialCalculator {
         return transactions.filter { $0.account.objectID == account.objectID && !excluded.contains($0.kind) }.reduce(account.openingBalance.decimalValue) { $0 + $1.amount.decimalValue }
     }
 
+    static func investmentCashBalance(account: Account, transactions: [FinancialTransaction]) -> Decimal {
+        let excluded: Set<String> = [TransactionKind.investmentBuy.rawValue, TransactionKind.investmentSell.rawValue]
+        return transactions.filter { $0.account.objectID == account.objectID && !excluded.contains($0.kind) }.reduce(account.openingBalance.decimalValue) { $0 + $1.amount.decimalValue }
+    }
+
     static func netWorthResult(accounts: [Account], transactions: [FinancialTransaction], quotes: [MarketQuote], currencyCode: String, rates: ExchangeRateService = .shared) -> NetWorthResult {
         var cash = Decimal.zero, investments = Decimal.zero, missing = 0
-        for account in accounts { if let value = rates.convert(cashBalance(account: account, transactions: transactions), from: account.currencyCode, to: currencyCode) { cash += value } else { missing += 1 } }
+        for account in accounts {
+            if account.kind.lowercased() == "investment" {
+                if let value = rates.convert(investmentCashBalance(account: account, transactions: transactions), from: account.currencyCode, to: currencyCode) { investments += value } else { missing += 1 }
+            } else if let value = rates.convert(cashBalance(account: account, transactions: transactions), from: account.currencyCode, to: currencyCode) { cash += value } else { missing += 1 }
+        }
         for position in investmentPositions(transactions, quotes: quotes) where position.quantity != 0 {
             let value = position.marketValue ?? position.remainingCost
             guard let converted = rates.convert(value, from: position.currencyCode, to: currencyCode) else { missing += 1; continue }; investments += converted

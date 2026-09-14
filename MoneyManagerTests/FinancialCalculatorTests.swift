@@ -396,9 +396,34 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(transactions.map(\.id), [ordinary.id])
     }
 
-    private func account(_ context: NSManagedObjectContext, currency: String, openingBalance: Decimal = 0) -> Account {
+    func testInvestmentTypeAccountAggregatesIntoInvestmentsBucket() {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let account = account(context, currency: "IDR", openingBalance: 10000000, kind: "Investment")
+        let defaults = UserDefaults(suiteName: "InvestmentBucket")!
+        defaults.removePersistentDomain(forName: "InvestmentBucket")
+        let rates = ExchangeRateService(defaults: defaults, provider: MockRateProvider(responses: [:]))
+        let result = FinancialCalculator.netWorthResult(accounts: [account], transactions: [], quotes: [], currencyCode: "IDR", rates: rates)
+        XCTAssertEqual(result.cash, 0)
+        XCTAssertEqual(result.investments, 10000000)
+        XCTAssertEqual(result.total, 10000000)
+    }
+
+    func testInvestmentAccountDepositAndBuyValuedWithoutDoubleCount() {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let account = account(context, currency: "USD", openingBalance: 0, kind: "Investment")
+        let deposit = transaction(context, account: account, amount: 1000, kind: .investmentDeposit)
+        let buy = transaction(context, account: account, amount: -800, kind: .investmentBuy); buy.investmentSymbol = "ETF"; buy.investmentQuantity = 10
+        let defaults = UserDefaults(suiteName: "InvestmentDeposit")!
+        defaults.removePersistentDomain(forName: "InvestmentDeposit")
+        let rates = ExchangeRateService(defaults: defaults, provider: MockRateProvider(responses: [:]))
+        let result = FinancialCalculator.netWorthResult(accounts: [account], transactions: [deposit, buy], quotes: [], currencyCode: "USD", rates: rates)
+        XCTAssertEqual(result.cash, 0)
+        XCTAssertEqual(result.investments, 1800)
+    }
+
+    private func account(_ context: NSManagedObjectContext, currency: String, openingBalance: Decimal = 0, kind: String = "Checking") -> Account {
         let account = Account(context: context)
-        account.id = UUID(); account.name = "Account"; account.kind = "Checking"; account.currencyCode = currency; account.openingBalance = NSDecimalNumber(decimal: openingBalance); account.createdAt = Date()
+        account.id = UUID(); account.name = "Account"; account.kind = kind; account.currencyCode = currency; account.openingBalance = NSDecimalNumber(decimal: openingBalance); account.createdAt = Date()
         return account
     }
 
