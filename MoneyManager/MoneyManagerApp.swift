@@ -631,6 +631,14 @@ struct SettingsView: View {
     @State private var showingRemoveDemoConfirmation = false
     @State private var showingResetConfirmation = false
     @State private var showingFinalResetConfirmation = false
+
+    private var neededCurrencies: [String] {
+        let accountCodes = accounts.filter { !$0.isArchived }.map { CurrencyFormatter.normalizedCode($0.currencyCode) }
+        let quoteCodes = quotes.map { CurrencyFormatter.normalizedCode($0.currencyCode) }
+        let defaults: Set<String> = ["USD", "SGD", "CNY"]
+        return Array(Set(accountCodes + quoteCodes).union(defaults).filter { $0 != "IDR" }).sorted()
+    }
+
     var body: some View {
         NavigationView { Form {
             Section("Security") { Toggle("Require device authentication", isOn: $lockEnabled) }
@@ -643,10 +651,13 @@ struct SettingsView: View {
                     Text("None").tag("")
                     ForEach(CurrencyFormatter.supportedCodes.filter { $0 != CurrencyFormatter.normalizedCode(baseCurrency) }, id: \.self) { Text($0) }
                 }
-                TextField("USD/IDR rate", value: Binding(get: { exchangeRates.usdIDRRate }, set: { exchangeRates.setUSDIDRRate($0) }), format: .number)
-                    .keyboardType(.decimalPad)
-                Text("Source: \(exchangeRates.data.source)")
-                Text("Updated: \(exchangeRates.data.lastUpdated.formatted(date: .abbreviated, time: .shortened))")
+                ForEach(neededCurrencies, id: \.self) { code in
+                    let pair = exchangeRates.pairs.first(where: { $0.from == code && $0.to == "IDR" })
+                    TextField("\(code)/IDR Rate", value: Binding(get: { pair?.rate }, set: { exchangeRates.setRate(from: code, to: "IDR", rate: $0) }), format: .number)
+                        .keyboardType(.decimalPad)
+                    Text("Source: \(pair?.source ?? "Manual")")
+                    Text("Updated: \(pair?.updatedAt.formatted(date: .abbreviated, time: .shortened) ?? "Never")")
+                }
             }
             Section("Categories") { Button("Manage Categories") { showingCategories = true } }
             Section("Data") {
