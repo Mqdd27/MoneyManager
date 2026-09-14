@@ -218,6 +218,18 @@ final class FinancialCalculatorTests: XCTestCase {
         XCTAssertEqual(snapshots.first?.totalValue.decimalValue, 32)
     }
 
+    func testInvestmentWithoutQuoteFallsBackToCostBasis() {
+        let context = PersistenceController(inMemory: true).container.viewContext
+        let account = account(context, currency: "IDR", openingBalance: 0)
+        let buy = transaction(context, account: account, amount: -5000000, kind: .investmentBuy); buy.investmentSymbol = "BBCA"; buy.investmentQuantity = 500
+        let defaults = UserDefaults(suiteName: "CostBasisFallback")!
+        defaults.removePersistentDomain(forName: "CostBasisFallback")
+        let rates = ExchangeRateService(defaults: defaults, provider: MockRateProvider(responses: [:]))
+        let result = FinancialCalculator.netWorthResult(accounts: [account], transactions: [buy], quotes: [], currencyCode: "IDR", rates: rates)
+        XCTAssertEqual(result.investments, 5000000)
+        XCTAssertEqual(result.unconvertibleCount, 0)
+    }
+
     func testNetWorthExcludesInvestmentCashMovement() {
         let context = PersistenceController(inMemory: true).container.viewContext
         let account = account(context, currency: "USD", openingBalance: 100)

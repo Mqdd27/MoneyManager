@@ -359,7 +359,8 @@ struct FinancialCalculator {
         var cash = Decimal.zero, investments = Decimal.zero, missing = 0
         for account in accounts { if let value = rates.convert(cashBalance(account: account, transactions: transactions), from: account.currencyCode, to: currencyCode) { cash += value } else { missing += 1 } }
         for position in investmentPositions(transactions, quotes: quotes) where position.quantity != 0 {
-            guard let value = position.marketValue, let converted = rates.convert(value, from: position.currencyCode, to: currencyCode) else { missing += 1; continue }; investments += converted
+            let value = position.marketValue ?? position.remainingCost
+            guard let converted = rates.convert(value, from: position.currencyCode, to: currencyCode) else { missing += 1; continue }; investments += converted
         }
         return NetWorthResult(cash: cash, investments: investments, unconvertibleCount: missing)
     }
