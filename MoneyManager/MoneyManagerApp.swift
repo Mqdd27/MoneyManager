@@ -634,8 +634,15 @@ struct AccountEditor: View {
     @Environment(\.dismiss) private var dismiss
     let account: Account?
     @FetchRequest(entity: FinancialTransaction.entity(), sortDescriptors: []) private var transactions: FetchedResults<FinancialTransaction>
-    @State private var name = ""; @State private var opening = "0"; @State private var kind = "Checking"; @State private var currencyCode = "IDR"; @State private var institution = ""; @State private var notes = ""; @State private var isArchived = false
-    init(account: Account? = nil) { self.account = account }
+    @State private var name: String; @State private var opening: String; @State private var kind: String; @State private var currencyCode: String; @State private var institution: String; @State private var notes: String; @State private var isArchived: Bool
+    @State private var saveError: String?
+    init(account: Account? = nil) {
+        self.account = account
+        _name = State(initialValue: account?.name ?? ""); _opening = State(initialValue: account?.openingBalance.stringValue ?? "0")
+        _kind = State(initialValue: account?.kind ?? "Checking"); _currencyCode = State(initialValue: account?.currencyCode ?? "IDR")
+        _institution = State(initialValue: account?.institution ?? ""); _notes = State(initialValue: account?.notes ?? "")
+        _isArchived = State(initialValue: account?.isArchived ?? false)
+    }
     private var hasTransactions: Bool { account.map { !AccountEditing.canChangeCurrency(account: $0, transactions: Array(transactions)) } ?? false }
     var body: some View {
         Form {
@@ -644,10 +651,18 @@ struct AccountEditor: View {
             TextField("Opening balance", text: $opening).keyboardType(.decimalPad)
             TextField("Institution", text: $institution); TextField("Notes", text: $notes); Toggle("Archived", isOn: $isArchived)
             if hasTransactions { Text("Currency cannot change after transactions are recorded.").foregroundColor(.secondary) }
-        }.navigationTitle(account == nil ? "New Account" : "Edit Account").onAppear(perform: load).toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || DecimalInputParser.parse(opening) == nil) } }
+        }.id(account?.id).navigationTitle(account == nil ? "New Account" : "Edit Account").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Save", action: save).disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || DecimalInputParser.parse(opening) == nil) } }
+        .alert("Couldn’t Save Account", isPresented: Binding(get: { saveError != nil }, set: { if !$0 { saveError = nil } })) { Button("OK", role: .cancel) {} } message: { Text(saveError ?? "") }
     }
-    private func load() { guard let account = account else { return }; name = account.name; opening = account.openingBalance.stringValue; kind = account.kind; currencyCode = account.currencyCode; institution = account.institution; notes = account.notes; isArchived = account.isArchived }
-    private func save() { guard let value = DecimalInputParser.parse(opening) else { return }; let object = account ?? Account(context: context); if account == nil { object.id = UUID(); object.createdAt = Date() }; object.name = name.trimmingCharacters(in: .whitespacesAndNewlines); object.kind = kind; if !hasTransactions { object.currencyCode = CurrencyFormatter.normalizedCode(currencyCode) }; object.openingBalance = NSDecimalNumber(decimal: value); object.institution = institution; object.notes = notes; object.isArchived = isArchived; object.updatedAt = Date(); try? context.save(); dismiss() }
+    private func save() {
+        guard let value = DecimalInputParser.parse(opening) else { return }
+        let object = account ?? Account(context: context)
+        if account == nil { object.id = UUID(); object.createdAt = Date() }
+        object.name = name.trimmingCharacters(in: .whitespacesAndNewlines); object.kind = kind
+        if !hasTransactions { object.currencyCode = CurrencyFormatter.normalizedCode(currencyCode) }
+        object.openingBalance = NSDecimalNumber(decimal: value); object.institution = institution; object.notes = notes; object.isArchived = isArchived; object.updatedAt = Date()
+        do { try context.save(); dismiss() } catch { saveError = error.localizedDescription }
+    }
 }
 
 struct TransactionsView: View {
